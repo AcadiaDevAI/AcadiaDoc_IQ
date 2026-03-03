@@ -150,6 +150,53 @@ def upload_files(files, ftype):
     return ids
 
 # ============================================================================
+# FULL RESET — Wipes ChromaDB, BM25, uploads from EC2, and session
+# ============================================================================
+def full_reset():
+    """
+    Called when user clicks Refresh or Reset All.
+    1. Calls POST /reset on API → deletes ChromaDB from disk, BM25 from memory,
+       uploaded files from EC2 volume, job records
+    2. Clears all Streamlit session state (chat history, file info, hashes)
+    3. Reruns the app (clean slate)
+    """
+    with st.spinner("🗑️ Deleting all data from server..."):
+        resp = api_call("POST", "/reset", timeout=30)
+
+        if resp:
+            s = resp.get("status", "unknown")
+            deleted = resp.get("deleted_files", 0)
+            jobs = resp.get("cleared_jobs", 0)
+
+            if s == "success":
+                st.success(f"✅ Reset complete — {deleted} files deleted, {jobs} jobs cleared, ChromaDB wiped")
+            elif s == "partial":
+                st.warning(f"⚠️ Partial reset — {resp.get('message', '')}")
+                errs = resp.get("errors", [])
+                if errs:
+                    for e in errs:
+                        st.caption(f"• {e}")
+            else:
+                st.error(f"❌ Reset returned: {s}")
+        else:
+            st.warning("⚠️ Could not reach server — clearing local session only")
+
+    # Clear ALL session state regardless of API result
+    st.session_state.messages = []
+    st.session_state.uploaded_files = {"log": None, "kb": None}
+    st.session_state.uploaded_hashes = set()
+    st.session_state.jobs = {}
+    st.session_state.security.update({
+        "upload_count": 0,
+        "query_count": 0,
+        "last_activity": datetime.now(),
+    })
+
+    time.sleep(1)  # let user see the success message
+    st.rerun()
+
+
+# ============================================================================
 # UI
 # ============================================================================
 def render_sidebar():
@@ -187,9 +234,8 @@ def render_sidebar():
         with c1:
             if st.button("🗑️ Chat", use_container_width=True): st.session_state.messages = []; st.rerun()
         with c2:
-            if st.button("📁 Reset", use_container_width=True):
-                st.session_state.uploaded_files = {"log": None, "kb": None}
-                st.session_state.uploaded_hashes = set(); st.rerun()
+            if st.button("🔄 Reset All", use_container_width=True, type="secondary"):
+                full_reset()
 
 
 def do_uploads(logs, kbs):
@@ -247,7 +293,8 @@ def render_chat():
         with c1: st.info(f"**Logs:** {li['count']} files ({li['total_size_mb']:.1f}MB)")
         with c2: st.info(f"**KB:** {ki['count']} files ({ki['total_size_mb']:.1f}MB)")
         with c3:
-            if st.button("🔄", use_container_width=True): st.rerun()
+            if st.button("🔄 Refresh", use_container_width=True):
+                full_reset()
     else:
         st.warning("📁 Upload logs + KB from sidebar to begin")
 

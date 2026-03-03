@@ -1,6 +1,8 @@
 import json
 import logging
 import hashlib
+import os
+import shutil
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -687,6 +689,89 @@ async def health_check():
             "max_log_chars": TOKEN_BUDGET["MAX_LOG_CONTEXT_CHARS"],
             "max_kb_chars": TOKEN_BUDGET["MAX_KB_CONTEXT_CHARS"],
         },
+    }
+
+
+@app.post("/reset")
+async def reset_all(_: bool = Depends(verify_api_key)):
+    """
+    FULL RESET: Deletes ALL indexed data from ChromaDB (disk + memory),
+    clears BM25 index, removes uploaded files from EC2 volume,
+    and clears all job tracking.
+
+    Called when user clicks Refresh in the UI.
+    """
+    global coll, bm25
+    errors = []
+
+    # 1. Delete ChromaDB data from disk
+    chroma_path = settings.CHROMA_PERSIST_DIR
+    try:
+        if os.path.exists(chroma_path):
+            shutil.rmtree(chroma_path)
+            logger.info("RESET: Deleted ChromaDB directory: %s", chroma_path)
+        os.makedirs(chroma_path, exist_ok=True)
+    except Exception as e:
+        logger.exception("RESET: Failed to delete ChromaDB: %s", e)
+        errors.append(f"ChromaDB cleanup: {e}")
+
+    # 2. Recreate ChromaDB collection (fresh)
+    try:
+        coll = get_collection()
+        logger.info("RESET: ChromaDB collection recreated")
+    except Exception as e:
+        logger.exception("RESET: Failed to recreate collection: %s", e)
+        errors.append(f"ChromaDB recreate: {e}")
+
+    # 3. Clear BM25 index
+    try:
+        if bm25:
+            bm25.clear()
+            logger.info("RESET: BM25 index cleared")
+    except Exception as e:
+        logger.exception("RESET: BM25 clear failed: %s", e)
+        errors.append(f"BM25 clear: {e}")
+
+    # 4. Delete uploaded files from EC2 volume
+    upload_dir = settings.UPLOAD_DIR
+    deleted_files = 0
+    try:
+        if upload_dir.exists():
+            for f in upload_dir.iterdir():
+                if f.is_file():
+                    f.unlink()
+                    deleted_files += 1
+            logger.info("RESET: Deleted %d files from %s", deleted_files, upload_dir)
+    except Exception as e:
+        logger.exception("RESET: Upload cleanup failed: %s", e)
+        errors.append(f"Upload cleanup: {e}")
+
+    # 5. Clear job tracking
+    job_count = len(UPLOAD_JOBS)
+    UPLOAD_JOBS.clear()
+    logger.info("RESET: Cleared %d job records", job_count)
+
+    # Summary
+    if errors:
+        logger.warning("RESET completed with %d errors: %s", len(errors), errors)
+        return {
+            "status": "partial",
+            "message": f"Reset completed with {len(errors)} errors",
+            "errors": errors,
+            "deleted_files": deleted_files,
+            "cleared_jobs": job_count,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    logger.info("RESET: Complete — all data deleted")
+    return {
+        "status": "success",
+        "message": "All data deleted — ChromaDB, BM25, uploads, jobs cleared",
+        "deleted_files": deleted_files,
+        "cleared_jobs": job_count,
+        "chroma_chunks": 0,
+        "bm25_docs": 0,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
