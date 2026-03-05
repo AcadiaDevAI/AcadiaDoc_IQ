@@ -223,6 +223,33 @@ class BM25Index:
         self.avg_doc_length = 0.0
         self.total_docs = 0
 
+    def remove_documents_by_source(self, source_name: str) -> int:
+        """Remove all documents whose metadata 'source' matches source_name."""
+        to_remove = [
+            doc_id for doc_id, meta in self.metadata.items()
+            if meta.get("source") == source_name
+        ]
+        for doc_id in to_remove:
+            # Remove from inverted index
+            tokens = set(self.doc_tokens.get(doc_id, []))
+            for token in tokens:
+                if token in self.inverted_index:
+                    self.inverted_index[token].discard(doc_id)
+                    if not self.inverted_index[token]:
+                        del self.inverted_index[token]
+            # Remove from all stores
+            self.documents.pop(doc_id, None)
+            self.metadata.pop(doc_id, None)
+            self.doc_tokens.pop(doc_id, None)
+            self.doc_lengths.pop(doc_id, None)
+        # Recalculate stats
+        self.total_docs = len(self.documents)
+        if self.total_docs > 0:
+            self.avg_doc_length = sum(self.doc_lengths.values()) / self.total_docs
+        else:
+            self.avg_doc_length = 0.0
+        return len(to_remove)
+
     @property
     def size(self) -> int:
         return self.total_docs

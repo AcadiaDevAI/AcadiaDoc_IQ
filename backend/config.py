@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     API_BASE: str = "http://localhost:8000"
     REQUEST_TIMEOUT: int = 30
 
+    # ── Clerk Authentication ──────────────────────────────────
+    # Get these from https://dashboard.clerk.com → API Keys
+    CLERK_SECRET_KEY: Optional[str] = None
+    CLERK_PUBLISHABLE_KEY: Optional[str] = None
+    # Set to "true" to enforce Clerk JWT auth on all endpoints
+    CLERK_ENABLED: str = "false"
+
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
         env_file_encoding="utf-8",

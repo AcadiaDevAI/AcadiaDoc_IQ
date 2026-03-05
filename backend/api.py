@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import settings
 from vector_store import get_collection, get_bm25_index, rebuild_bm25_from_chroma, reset_chroma_collection
+from clerk_auth import clerk_auth_dependency, is_clerk_enabled
 
 
 if sys.version_info < (3, 11):
@@ -42,18 +43,6 @@ logger = logging.getLogger("acadia-log-iq")
 
 # ============================================================================
 # TOKEN BUDGET — MISTRAL 7B (32K CONTEXT)
-# ============================================================================
-# Conservative: 1 token ~ 3 chars for Mistral tokenizer
-#
-# ┌──────────────────────────────────────────────────────────┐
-# │  MISTRAL 7B TOKEN BUDGET (32,768 tokens)                │
-# ├──────────────────────────────────────────────────────────┤
-# │  System prompt + question       ~500 tokens  (1,500 ch) │
-# │  Log context (max)            ~8,000 tokens (24,000 ch) │
-# │  KB context (max)             ~8,000 tokens (24,000 ch) │
-# │  Generation output (reserved) ~2,048 tokens             │
-# │  Safety buffer               ~14,220 tokens             │
-# └──────────────────────────────────────────────────────────┘
 # ============================================================================
 CHARS_PER_TOKEN = 3
 
@@ -75,7 +64,6 @@ CHUNK_CONFIG = {
     "OVERLAP_LINES": 10,
 }
 
-# Hybrid search config
 HYBRID_CONFIG = {
     "VECTOR_WEIGHT": 0.6,
     "BM25_WEIGHT": 0.4,
@@ -107,6 +95,16 @@ class JobInfo(TypedDict, total=False):
 UPLOAD_JOBS: Dict[str, JobInfo] = {}
 coll = None
 bm25 = None
+
+
+# ============================================================================
+# IN-MEMORY STORES (chat history + uploaded file registry)
+# ============================================================================
+# Chat sessions: { session_id: { "id": str, "title": str, "messages": [...], "created_at": str, "updated_at": str } }
+CHAT_SESSIONS: Dict[str, dict] = {}
+
+# Uploaded files registry: { file_id: { "id": str, "name": str, "file_type": str, "size_mb": float, "status": str, "job_id": str, "uploaded_at": str } }
+UPLOADED_FILES: Dict[str, dict] = {}
 
 
 # ============================================================================
@@ -162,17 +160,49 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
+        # EC2: allow all origins (tighten in production)
+        "*",
+    ],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
     expose_headers=["X-Processing-Time"], max_age=600,
 )
 
 
 def verify_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> bool:
+    """Legacy API key check — still works when Clerk is disabled."""
     if settings.API_KEY:
         if not x_api_key or x_api_key != settings.API_KEY:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
     return True
+
+
+async def auth_dependency(
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Optional[str]:
+    """
+    Combined authentication dependency.
+
+    Priority:
+    1. If CLERK_ENABLED=true → require Clerk JWT Bearer token
+    2. Else if API_KEY is set → require X-API-Key header
+    3. Else → open access (no auth)
+
+    Returns: Clerk user_id (str) or None
+    """
+    if is_clerk_enabled():
+        # Clerk mode: require Bearer token
+        user_id = await clerk_auth_dependency(request)
+        return user_id
+    else:
+        # Legacy mode: API key check
+        verify_api_key(x_api_key)
+        return None
 
 
 # ============================================================================
@@ -180,6 +210,7 @@ def verify_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-
 # ============================================================================
 class Question(BaseModel):
     q: str = Field(min_length=1, max_length=1000)
+    session_id: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
     @field_validator("q")
     @classmethod
@@ -190,6 +221,7 @@ class Question(BaseModel):
 
 class UploadResponse(BaseModel):
     job_id: str
+    file_id: str
     message: str
     file_hash: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
@@ -211,12 +243,34 @@ class JobStatus(BaseModel):
 
 class AnswerResponse(BaseModel):
     answer: str
-    log_sources: List[str]
-    kb_sources: List[str]
+    sources: List[str]
     confidence: float = Field(ge=0, le=1)
     processing_time_ms: Optional[int] = None
     context_stats: Optional[Dict] = None
+    session_id: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+    sources: Optional[Dict] = None
+    timestamp: str
+
+class ChatSession(BaseModel):
+    id: str
+    title: str
+    messages: List[ChatMessage]
+    created_at: str
+    updated_at: str
+
+class FileInfo(BaseModel):
+    id: str
+    name: str
+    file_type: str
+    size_mb: float
+    status: str
+    job_id: Optional[str] = None
+    uploaded_at: str
 
 
 # ============================================================================
@@ -247,7 +301,6 @@ def estimate_tokens(text: str) -> int:
 
 
 def safe_generate(prompt: str, max_tokens: int = None) -> str:
-    """Mistral 7B generation with Layer 3 hard truncation safety."""
     if max_tokens is None:
         max_tokens = TOKEN_BUDGET["MAX_GENERATION_TOKENS"]
     try:
@@ -299,15 +352,10 @@ def safe_generate(prompt: str, max_tokens: int = None) -> str:
 def hybrid_search(
     query: str, query_embedding: List[float], file_type: str, n_results: int = 10,
 ) -> List[Tuple[str, str, Dict, float]]:
-    """
-    Merge ChromaDB vector results and BM25 keyword results using
-    Reciprocal Rank Fusion (RRF).
-    """
     v_weight = HYBRID_CONFIG["VECTOR_WEIGHT"]
     b_weight = HYBRID_CONFIG["BM25_WEIGHT"]
     rrf_k = 60
 
-    # Vector search
     vector_results = {}
     try:
         cr = coll.query(
@@ -328,7 +376,6 @@ def hybrid_search(
     except Exception as e:
         logger.warning("Vector search failed (%s): %s", file_type, e)
 
-    # BM25 search
     bm25_results = {}
     try:
         if bm25 and bm25.size > 0:
@@ -342,7 +389,6 @@ def hybrid_search(
     except Exception as e:
         logger.warning("BM25 search failed: %s", e)
 
-    # RRF merge
     combined: Dict[str, float] = {}
     all_data: Dict[str, dict] = {}
 
@@ -375,14 +421,9 @@ def hybrid_search(
 def rerank_chunks(
     query: str, chunks: List[Tuple[str, str, Dict, float]], top_k: int = 6,
 ) -> List[Tuple[str, str, Dict, float]]:
-    """
-    Re-rank retrieved chunks by asking Mistral 7B to score each for relevance.
-    Single LLM call scores all candidates. Falls back to hybrid scores on failure.
-    """
     if not chunks or len(chunks) <= 1:
         return chunks[:top_k]
 
-    # Limit candidates to avoid blowing the re-rank prompt budget
     candidates = chunks[:min(len(chunks), 12)]
 
     previews = []
@@ -402,7 +443,6 @@ Respond ONLY with a JSON array: [{{"chunk":1,"score":8}}, ...]"""
     try:
         resp = safe_generate(rerank_prompt, max_tokens=512)
 
-        # Extract JSON
         raw = resp.strip()
         if "```" in raw:
             raw = raw.split("```")[1] if "```json" not in raw else raw.split("```json")[1].split("```")[0]
@@ -421,7 +461,6 @@ Respond ONLY with a JSON array: [{{"chunk":1,"score":8}}, ...]"""
                 final = (relevance / 10.0) * 0.7 + orig * 30 * 0.3
                 scored.append((did, text, meta, final))
 
-        # Add unscored candidates
         scored_ids = {s[0] for s in scored}
         for c in candidates:
             if c[0] not in scored_ids:
@@ -452,11 +491,46 @@ def truncate_chunk(text: str, max_chars: int) -> str:
 def assemble_context(
     ranked: List[Tuple[str, str, Dict, float]], max_total_chars: int,
 ) -> Tuple[str, List[str]]:
-    """Build context from ranked chunks. Returns (context_str, sources)."""
+    """
+    Build context from ranked chunks. Returns (context_str, sources).
+
+    Source filtering strategy:
+    1. Aggregate total relevance scores per source document
+    2. Only documents whose aggregate score is >= 25% of the top
+       document's aggregate score appear in the Sources list
+    3. All chunks are still sent to the LLM for context, but only
+       truly relevant documents are shown to the user as sources
+
+    This handles RRF's compressed score range by looking at the
+    cumulative contribution of each document, not individual chunks.
+    """
     max_chunk = TOKEN_BUDGET["MAX_SINGLE_CHUNK_CHARS"]
     if not ranked:
         return "", []
 
+    # Step 1: Aggregate scores per source document
+    source_scores: Dict[str, float] = {}
+    for _, text, meta, score in ranked:
+        if not text or not text.strip():
+            continue
+        src = meta.get("source", "unknown")
+        source_scores[src] = source_scores.get(src, 0.0) + score
+
+    # Step 2: Determine which sources are "relevant"
+    if source_scores:
+        top_doc_score = max(source_scores.values())
+        relevant_sources = {
+            src for src, total in source_scores.items()
+            if total >= top_doc_score * 0.25
+        }
+    else:
+        relevant_sources = set()
+
+    logger.info("Source scores: %s | Relevant: %s",
+                {s: f"{v:.6f}" for s, v in source_scores.items()},
+                relevant_sources)
+
+    # Step 3: Assemble context (all chunks for LLM, filtered sources for UI)
     parts, sources, total = [], set(), 0
     for i, (_, text, meta, score) in enumerate(ranked):
         if not text or not text.strip():
@@ -468,10 +542,12 @@ def assemble_context(
             remaining = max_total_chars - total
             if remaining > 300:
                 parts.append(f"[Source: {src}]\n{truncate_chunk(chunk, remaining - 60)}")
-                sources.add(src)
+                if src in relevant_sources:
+                    sources.add(src)
             break
         parts.append(entry)
-        sources.add(src)
+        if src in relevant_sources:
+            sources.add(src)
         total += len(entry)
 
     return "\n\n".join(parts), sorted(s for s in sources if s)
@@ -593,11 +669,16 @@ def iter_line_chunks(fp: Path, lines_per=None):
 # ============================================================================
 # INDEX JOB — UPDATES BOTH CHROMA + BM25
 # ============================================================================
-async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str):
+async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str, file_id: str):
     try:
         job = UPLOAD_JOBS.get(job_id)
         if not job: return
         job["status"] = "running"
+
+        # Update file registry
+        if file_id in UPLOADED_FILES:
+            UPLOADED_FILES[file_id]["status"] = "processing"
+
         total, ok = 0, 0
         b_emb, b_doc, b_meta, b_ids = [], [], [], []
         bm25_ids, bm25_docs, bm25_metas = [], [], []
@@ -637,6 +718,11 @@ async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str):
         job.update({"status": "done", "processed_chunks": ok,
                      "total_chunks": total, "successful_chunks": ok,
                      "completed_at": datetime.now(timezone.utc)})
+
+        # Update file registry
+        if file_id in UPLOADED_FILES:
+            UPLOADED_FILES[file_id]["status"] = "indexed"
+
         logger.info("Job %s DONE: %d/%d from %s", job_id, ok, total, filename)
 
     except Exception as e:
@@ -646,6 +732,8 @@ async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str):
                 "status": "failed", "error": str(e),
                 "completed_at": datetime.now(timezone.utc),
             })
+        if file_id in UPLOADED_FILES:
+            UPLOADED_FILES[file_id]["status"] = "failed"
         try: fp.unlink(missing_ok=True)
         except: pass
 
@@ -665,7 +753,7 @@ async def log_requests(request: Request, call_next):
 
 
 # ============================================================================
-# ROUTES
+# ROUTES — HEALTH
 # ============================================================================
 @app.get("/health")
 async def health_check():
@@ -683,6 +771,7 @@ async def health_check():
             "bedrock": "available",
         },
         "search_mode": "hybrid (vector + BM25 + re-ranking)",
+        "auth_mode": "clerk" if is_clerk_enabled() else ("api_key" if settings.API_KEY else "open"),
         "token_budget": {
             "model_max": TOKEN_BUDGET["MODEL_MAX_TOKENS"],
             "max_log_chars": TOKEN_BUDGET["MAX_LOG_CONTEXT_CHARS"],
@@ -691,41 +780,52 @@ async def health_check():
     }
 
 
+# ============================================================================
+# ROUTES — AUTH / USER
+# ============================================================================
+@app.get("/me")
+async def get_current_user(request: Request, user_id: Optional[str] = Depends(auth_dependency)):
+    """
+    Returns current user info.
+    - If Clerk enabled: returns Clerk user_id from JWT
+    - If Clerk disabled: returns anonymous
+    """
+    if is_clerk_enabled() and user_id:
+        payload = getattr(request.state, "clerk_payload", {})
+        return {
+            "authenticated": True,
+            "user_id": user_id,
+            "issuer": payload.get("iss"),
+            "auth_mode": "clerk",
+        }
+    return {
+        "authenticated": False,
+        "user_id": None,
+        "auth_mode": "api_key" if settings.API_KEY else "open",
+    }
+
+
+# ============================================================================
+# ROUTES — RESET
+# ============================================================================
 @app.post("/reset")
-async def reset_all(_: bool = Depends(verify_api_key)):
-    """
-    FULL RESET — safely clears all data without filesystem corruption.
-
-    Uses ChromaDB's own delete_collection API (NOT shutil.rmtree) to avoid:
-    - "Device or resource busy" (can't rmtree a Docker mount point)
-    - "readonly database" (corrupted SQLite WAL after partial deletion)
-
-    Steps:
-    1. ChromaDB: delete_collection + recreate (same SQLite connection)
-    2. BM25: clear in-memory index
-    3. Uploads: delete files from EC2 volume
-    4. Jobs: clear in-memory tracking
-    """
+async def reset_all(user_id: Optional[str] = Depends(auth_dependency)):
     global coll, bm25
     errors = []
 
-    # 1. Reset ChromaDB via API (safe — no filesystem deletion)
     deleted_chunks = 0
     try:
         deleted_chunks = reset_chroma_collection()
-        # Get fresh collection reference
         coll = get_collection()
-        logger.info("RESET: ChromaDB cleared (%d chunks deleted), fresh collection ready", deleted_chunks)
+        logger.info("RESET: ChromaDB cleared (%d chunks deleted)", deleted_chunks)
     except Exception as e:
         logger.exception("RESET: ChromaDB reset failed: %s", e)
         errors.append(f"ChromaDB: {e}")
-        # Try to at least get a working collection reference
         try:
             coll = get_collection()
         except Exception:
             pass
 
-    # 2. Clear BM25 keyword index
     try:
         if bm25:
             old_size = bm25.size
@@ -735,7 +835,6 @@ async def reset_all(_: bool = Depends(verify_api_key)):
         logger.exception("RESET: BM25 clear failed: %s", e)
         errors.append(f"BM25: {e}")
 
-    # 3. Delete uploaded files from EC2 volume
     deleted_files = 0
     try:
         upload_dir = settings.UPLOAD_DIR
@@ -752,21 +851,18 @@ async def reset_all(_: bool = Depends(verify_api_key)):
         logger.exception("RESET: Upload cleanup failed: %s", e)
         errors.append(f"Uploads: {e}")
 
-    # 4. Clear job tracking
     job_count = len(UPLOAD_JOBS)
     UPLOAD_JOBS.clear()
+    UPLOADED_FILES.clear()
+    CHAT_SESSIONS.clear()
     logger.info("RESET: Cleared %d job records", job_count)
 
-    # Verify ChromaDB is truly empty
     verify_count = 0
     try:
-        if coll:
-            verify_count = coll.count()
-    except Exception:
-        pass
+        if coll: verify_count = coll.count()
+    except: pass
 
     if errors:
-        logger.warning("RESET partial (%d errors): %s", len(errors), errors)
         return {
             "status": "partial",
             "message": f"Reset completed with {len(errors)} error(s)",
@@ -779,11 +875,9 @@ async def reset_all(_: bool = Depends(verify_api_key)):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-    logger.info("RESET: Complete — %d chunks, %d files, %d jobs cleared",
-                deleted_chunks, deleted_files, job_count)
     return {
         "status": "success",
-        "message": "All data deleted — ChromaDB, BM25, uploads, jobs cleared",
+        "message": "All data deleted",
         "deleted_chunks": deleted_chunks,
         "deleted_files": deleted_files,
         "cleared_jobs": job_count,
@@ -793,19 +887,23 @@ async def reset_all(_: bool = Depends(verify_api_key)):
     }
 
 
+# ============================================================================
+# ROUTES — UPLOAD
+# ============================================================================
 @app.post("/upload", response_model=UploadResponse)
 @limiter.limit("10/minute")
 async def upload(
     request: Request, background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    file_type: str = Query(default="log", pattern="^(log|kb)$"),
-    _: bool = Depends(verify_api_key),
+    file_type: str = Query(default="kb", pattern="^(kb)$"),
+    user_id: Optional[str] = Depends(auth_dependency),
 ):
     ext = Path(file.filename).suffix[1:].lower() if file.filename else ""
     if not ext or ext not in settings.ALLOWED_FILE_TYPES:
         raise HTTPException(400, f"Type '{ext}' not allowed. Allowed: {settings.ALLOWED_FILE_TYPES}")
 
     job_id = uuid.uuid4().hex
+    file_id = uuid.uuid4().hex
     fp = settings.UPLOAD_DIR / f"{job_id}_{Path(file.filename).name}"
     content = await file.read()
     size_mb = len(content) / (1024 * 1024)
@@ -822,29 +920,192 @@ async def upload(
         "file_size_mb": size_mb, "file_hash": fh,
         "created_at": datetime.now(timezone.utc),
     }
-    background_tasks.add_task(index_file_job, job_id, fp, file.filename, file_type)
+
+    # Register file
+    UPLOADED_FILES[file_id] = {
+        "id": file_id,
+        "name": file.filename,
+        "file_type": file_type,
+        "size_mb": round(size_mb, 2),
+        "status": "uploading",
+        "job_id": job_id,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    background_tasks.add_task(index_file_job, job_id, fp, file.filename, file_type, file_id)
     logger.info("Upload: %s (%.1fMB, %s)", file.filename, size_mb, file_type)
-    return UploadResponse(job_id=job_id, message="Uploaded. Processing started.", file_hash=fh)
+    return UploadResponse(job_id=job_id, file_id=file_id, message="Uploaded. Processing started.", file_hash=fh)
 
 
 @app.get("/upload_status/{job_id}", response_model=JobStatus)
-async def upload_status(job_id: str, _: bool = Depends(verify_api_key)):
+async def upload_status(job_id: str, user_id: Optional[str] = Depends(auth_dependency)):
     job = UPLOAD_JOBS.get(job_id)
     if not job: raise HTTPException(404, "Job not found")
     return JobStatus(**job)
 
 
+# ============================================================================
+# ROUTES — FILES
+# ============================================================================
+@app.get("/files")
+async def list_files(user_id: Optional[str] = Depends(auth_dependency)):
+    """List all uploaded files with their status."""
+    files = sorted(UPLOADED_FILES.values(), key=lambda x: x["uploaded_at"], reverse=True)
+    return {"files": files, "total": len(files)}
+
+
+@app.delete("/files/{file_id}")
+async def delete_file(file_id: str, user_id: Optional[str] = Depends(auth_dependency)):
+    """
+    Fully delete a file and all its indexed data:
+    1. Remove all chunks from ChromaDB (vector store)
+    2. Remove all chunks from BM25 (keyword index)
+    3. Remove physical file from uploads directory (if still there)
+    4. Remove from file registry
+    """
+    if file_id not in UPLOADED_FILES:
+        raise HTTPException(404, "File not found")
+
+    file_info = UPLOADED_FILES[file_id]
+    filename = file_info["name"]
+    job_id = file_info.get("job_id")
+    deleted_chunks = 0
+    errors = []
+
+    # 1. Delete from ChromaDB — find all chunks with this source filename
+    try:
+        if coll:
+            # ChromaDB where filter to find chunks from this file
+            results = coll.get(
+                where={"source": filename},
+                include=[],
+            )
+            chunk_ids = results.get("ids", [])
+            if chunk_ids:
+                coll.delete(ids=chunk_ids)
+                deleted_chunks = len(chunk_ids)
+                logger.info("DELETE FILE: Removed %d chunks from ChromaDB for '%s'", deleted_chunks, filename)
+    except Exception as e:
+        logger.exception("DELETE FILE: ChromaDB cleanup failed for '%s': %s", filename, e)
+        errors.append(f"ChromaDB: {e}")
+
+    # 2. Delete from BM25 index
+    bm25_removed = 0
+    try:
+        if bm25:
+            bm25_removed = bm25.remove_documents_by_source(filename)
+            logger.info("DELETE FILE: Removed %d docs from BM25 for '%s'", bm25_removed, filename)
+    except Exception as e:
+        logger.exception("DELETE FILE: BM25 cleanup failed for '%s': %s", filename, e)
+        errors.append(f"BM25: {e}")
+
+    # 3. Delete physical file from uploads directory (if it still exists)
+    try:
+        upload_dir = settings.UPLOAD_DIR
+        if upload_dir.exists():
+            for f in upload_dir.iterdir():
+                if f.is_file() and filename in f.name:
+                    f.unlink()
+                    logger.info("DELETE FILE: Removed file '%s' from disk", f.name)
+    except Exception as e:
+        logger.warning("DELETE FILE: Disk cleanup failed: %s", e)
+
+    # 4. Remove from registry and jobs
+    del UPLOADED_FILES[file_id]
+    if job_id and job_id in UPLOAD_JOBS:
+        del UPLOAD_JOBS[job_id]
+
+    if errors:
+        return {
+            "status": "partial",
+            "file_id": file_id,
+            "filename": filename,
+            "deleted_chunks": deleted_chunks,
+            "bm25_removed": bm25_removed,
+            "errors": errors,
+        }
+
+    return {
+        "status": "deleted",
+        "file_id": file_id,
+        "filename": filename,
+        "deleted_chunks": deleted_chunks,
+        "bm25_removed": bm25_removed,
+    }
+
+
+# ============================================================================
+# ROUTES — CHAT HISTORY
+# ============================================================================
+@app.get("/chat/sessions")
+async def list_sessions(user_id: Optional[str] = Depends(auth_dependency)):
+    """List all chat sessions (sorted by most recent)."""
+    sessions = sorted(
+        [{"id": s["id"], "title": s["title"], "updated_at": s["updated_at"], "message_count": len(s["messages"])}
+         for s in CHAT_SESSIONS.values()],
+        key=lambda x: x["updated_at"], reverse=True,
+    )
+    return {"sessions": sessions}
+
+
+@app.get("/chat/sessions/{session_id}")
+async def get_session(session_id: str, user_id: Optional[str] = Depends(auth_dependency)):
+    """Get full chat session with messages."""
+    session = CHAT_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+    return session
+
+
+@app.delete("/chat/sessions/{session_id}")
+async def delete_session(session_id: str, user_id: Optional[str] = Depends(auth_dependency)):
+    if session_id not in CHAT_SESSIONS:
+        raise HTTPException(404, "Session not found")
+    del CHAT_SESSIONS[session_id]
+    return {"status": "deleted", "session_id": session_id}
+
+
+@app.delete("/chat/sessions")
+async def delete_all_sessions(user_id: Optional[str] = Depends(auth_dependency)):
+    count = len(CHAT_SESSIONS)
+    CHAT_SESSIONS.clear()
+    return {"status": "cleared", "deleted_count": count}
+
+
+def _save_message_to_session(session_id: Optional[str], role: str, content: str, sources: Optional[Dict] = None) -> str:
+    """Save a message to a chat session. Creates session if needed. Returns session_id."""
+    now = datetime.now(timezone.utc).isoformat()
+
+    if not session_id or session_id not in CHAT_SESSIONS:
+        session_id = uuid.uuid4().hex
+        title = content[:60] + "..." if len(content) > 60 else content
+        CHAT_SESSIONS[session_id] = {
+            "id": session_id,
+            "title": title,
+            "messages": [],
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    msg = {"role": role, "content": content, "timestamp": now}
+    if sources:
+        msg["sources"] = sources
+
+    CHAT_SESSIONS[session_id]["messages"].append(msg)
+    CHAT_SESSIONS[session_id]["updated_at"] = now
+    return session_id
+
+
+# ============================================================================
+# ROUTES — ASK
+# ============================================================================
 @app.post("/ask", response_model=AnswerResponse)
 @limiter.limit("30/minute")
-async def ask(request: Request, req: Question, _: bool = Depends(verify_api_key)):
+async def ask(request: Request, req: Question, user_id: Optional[str] = Depends(auth_dependency)):
     """
     RAG pipeline: Hybrid Search → Re-Rank → Budget Assembly → Generate.
 
-    1. Embed question
-    2. Hybrid search: Vector (ChromaDB) + Keyword (BM25) merged via RRF
-    3. Re-rank: LLM scores each chunk for relevance
-    4. Assemble context within 32K token budget
-    5. Generate answer with Mistral 7B
+    Searches all uploaded documents (single unified search).
     """
     import time
     start = time.perf_counter()
@@ -852,71 +1113,68 @@ async def ask(request: Request, req: Question, _: bool = Depends(verify_api_key)
     if not coll:
         raise HTTPException(503, "Vector store not ready")
 
+    # Save user message to session
+    session_id = _save_message_to_session(req.session_id, "user", req.q)
+
     q_emb = safe_embed(req.q)
     if not q_emb:
         raise HTTPException(500, "Embedding failed")
 
-    # 2. HYBRID SEARCH
-    log_cands = hybrid_search(req.q, q_emb, "log", HYBRID_CONFIG["VECTOR_CANDIDATES"])
-    kb_cands = hybrid_search(req.q, q_emb, "kb", HYBRID_CONFIG["BM25_CANDIDATES"])
+    # Single unified search across all documents (type "kb")
+    doc_cands = hybrid_search(req.q, q_emb, "kb", HYBRID_CONFIG["VECTOR_CANDIDATES"])
 
-    # 3. RE-RANK
-    log_ranked = rerank_chunks(req.q, log_cands, HYBRID_CONFIG["RERANK_TOP_K_LOG"])
-    kb_ranked = rerank_chunks(req.q, kb_cands, HYBRID_CONFIG["RERANK_TOP_K_KB"])
+    # Re-rank
+    doc_ranked = rerank_chunks(req.q, doc_cands, HYBRID_CONFIG["RERANK_TOP_K_LOG"] + HYBRID_CONFIG["RERANK_TOP_K_KB"])
 
-    # 4. ASSEMBLE (Layer 1)
-    log_ctx, log_src = assemble_context(log_ranked, TOKEN_BUDGET["MAX_LOG_CONTEXT_CHARS"])
-    kb_ctx, kb_src = assemble_context(kb_ranked, TOKEN_BUDGET["MAX_KB_CONTEXT_CHARS"])
+    # Assemble context
+    max_ctx_chars = TOKEN_BUDGET["MAX_LOG_CONTEXT_CHARS"] + TOKEN_BUDGET["MAX_KB_CONTEXT_CHARS"]
+    doc_ctx, doc_src = assemble_context(doc_ranked, max_ctx_chars)
 
-    if not log_ctx: log_ctx = "No relevant log entries found."
-    if not kb_ctx: kb_ctx = "No relevant knowledge base articles found."
+    if not doc_ctx:
+        doc_ctx = "No relevant documents found."
 
     # Layer 2: combined check
-    combined = len(log_ctx) + len(kb_ctx)
-    max_comb = MAX_TOTAL_PROMPT_CHARS - TOKEN_BUDGET["PROMPT_OVERHEAD_CHARS"]
-    if combined > max_comb:
-        half = max_comb // 2
-        if len(log_ctx) > half: log_ctx = truncate_chunk(log_ctx, half)
-        if len(kb_ctx) > half: kb_ctx = truncate_chunk(kb_ctx, half)
+    if len(doc_ctx) > MAX_TOTAL_PROMPT_CHARS - TOKEN_BUDGET["PROMPT_OVERHEAD_CHARS"]:
+        doc_ctx = truncate_chunk(doc_ctx, MAX_TOTAL_PROMPT_CHARS - TOKEN_BUDGET["PROMPT_OVERHEAD_CHARS"])
 
-    confidence = min(0.3 + len(log_ranked) * 0.08 + len(kb_ranked) * 0.1, 1.0)
+    confidence = min(0.3 + len(doc_ranked) * 0.1, 1.0)
 
-    prompt = f"""You are an expert system administrator analyzing logs and knowledge base articles.
-The chunks below are ranked by relevance to the question.
+    prompt = f"""You are an expert AI assistant analyzing uploaded documents.
+The document chunks below are ranked by relevance to the question.
 
-LOG ENTRIES:
-{log_ctx}
-
-KNOWLEDGE BASE ARTICLES:
-{kb_ctx}
+DOCUMENTS:
+{doc_ctx}
 
 USER QUESTION: {req.q}
 
-Provide a concise, accurate answer:
-- Explain errors with specifics (timestamps, error codes, device IDs).
-- Summarize relevant KB solutions.
-- Reference specific sources.
+Provide a concise, accurate answer based on the documents:
+- Reference specific source documents when possible.
+- If the answer comes from a specific document, mention it.
 - If insufficient info, say what's needed.
 
 ANSWER:"""
 
     ptok = estimate_tokens(prompt)
     max_tok = TOKEN_BUDGET["MODEL_MAX_TOKENS"] - TOKEN_BUDGET["MAX_GENERATION_TOKENS"]
-    logger.info("ASK: q='%s' | log=%d kb=%d | ~%d tok (limit %d)",
-                req.q[:50], len(log_ctx), len(kb_ctx), ptok, max_tok)
+    logger.info("ASK: q='%s' | docs=%d | ~%d tok (limit %d)",
+                req.q[:50], len(doc_ctx), ptok, max_tok)
 
-    # Layer 3: safe_generate
     answer = safe_generate(prompt)
     ms = int((time.perf_counter() - start) * 1000)
 
+    # Save assistant message to session
+    sources_dict = {"docs": doc_src}
+    _save_message_to_session(session_id, "assistant", answer, sources_dict)
+
     return AnswerResponse(
-        answer=answer, log_sources=log_src, kb_sources=kb_src,
+        answer=answer, sources=doc_src,
         confidence=confidence, processing_time_ms=ms,
+        session_id=session_id,
         context_stats={
             "search_mode": "hybrid (vector + BM25 + re-ranking)",
-            "log_candidates": len(log_cands), "kb_candidates": len(kb_cands),
-            "log_after_rerank": len(log_ranked), "kb_after_rerank": len(kb_ranked),
-            "log_context_chars": len(log_ctx), "kb_context_chars": len(kb_ctx),
+            "doc_candidates": len(doc_cands),
+            "doc_after_rerank": len(doc_ranked),
+            "doc_context_chars": len(doc_ctx),
             "prompt_chars": len(prompt), "prompt_tokens": ptok,
             "max_tokens": max_tok, "headroom": max_tok - ptok,
         },
