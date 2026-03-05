@@ -5,7 +5,7 @@
 #   docker compose -f docker-compose.ec2.yml up --build -d
 
 
-services:
+services: 
   api:
     build:
       context: ./backend
