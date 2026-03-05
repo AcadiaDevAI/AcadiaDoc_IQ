@@ -39,7 +39,7 @@ services:
         REACT_APP_API_BASE: http://${EC2_PUBLIC_IP:-localhost}:8000
         REACT_APP_CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:-}
     ports:
-      - "3000:3000"
+      - "8501:80"
     depends_on:
       api:
         condition: service_healthy
