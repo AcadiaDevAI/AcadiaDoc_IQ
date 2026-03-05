@@ -4,7 +4,6 @@
 #   export CLERK_PUBLISHABLE_KEY=pk_test_xxxx  (or pk_live_xxxx)
 #   docker compose -f docker-compose.ec2.yml up --build -d
 
-version: "3.8"
 
 services:
   api:
