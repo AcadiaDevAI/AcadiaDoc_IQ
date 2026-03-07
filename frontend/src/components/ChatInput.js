@@ -44,14 +44,14 @@ export default function ChatInput({ onSend }) {
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={
-            state.isUploading ? "Upload in progress..." : state.isLoading ? "Thinking..." : "Ask about your logs..."
+            state.isUploading ? "Upload in progress..." : state.isLoading ? "Thinking..." : "How can I help you today?"
           }
           disabled={disabled}
           rows={1}
           className="flex-1 text-sm resize-none outline-none py-1.5 max-h-40 font-sans disabled:opacity-50"
           style={{ background: "transparent", color: "var(--text-primary)", caretColor: "var(--brand-accent)" }}
         />
-        <Tooltip title={disabled ? "Please wait..." : !input.trim() ? "Type a question" : "Send (Enter)"}>
+        {/* <Tooltip title={disabled ? "Please wait..." : !input.trim() ? "Type a question" : "Send (Enter)"}>
           <Button
             type="primary"
             shape="circle"
@@ -61,10 +61,30 @@ export default function ChatInput({ onSend }) {
             disabled={disabled || !input.trim()}
             className="mb-0.5 flex-shrink-0"
           />
-        </Tooltip>
+        </Tooltip> */}
+  <Tooltip title={disabled ? "Please wait..." : !input.trim() ? "Type a question" : "Send (Enter)"}>
+  <Button
+    type="primary"
+    shape="circle"
+    size="small"
+    icon={state.isLoading ? <LoadingOutlined spin /> : <SendOutlined className="text-xs" />}
+    onClick={handleSubmit}
+    disabled={disabled || !input.trim()}
+    className="mb-0.5 flex-shrink-0"
+    style={
+      !disabled && input.trim()
+        ? {
+            backgroundColor: "#0A3F63",
+            borderColor: "#0A3F63",
+            color: "#fff",
+          }
+        : {}
+    }
+  />
+</Tooltip>
       </div>
       <p className="text-center text-[10px] t-text-faint mt-2 max-w-4xl mx-auto">
-        Powered by Hybrid Search (Vector + BM25) + LLM Re-ranking · Mistral 7B
+        {/* Powered by Hybrid Search (Vector + BM25) + LLM Re-ranking · Mistral 7B */}
       </p>
     </div>
   );

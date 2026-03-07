@@ -7,7 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, TypedDict
+from typing import Dict, List, Optional, Tuple, TypedDict, Set
 
 import boto3
 from botocore.config import Config as BotoConfig
@@ -67,8 +67,8 @@ CHUNK_CONFIG = {
 HYBRID_CONFIG = {
     "VECTOR_WEIGHT": 0.6,
     "BM25_WEIGHT": 0.4,
-    "VECTOR_CANDIDATES": 15,
-    "BM25_CANDIDATES": 15,
+    "VECTOR_CANDIDATES": 20,
+    "BM25_CANDIDATES": 20,
     "RERANK_TOP_K_LOG": 6,
     "RERANK_TOP_K_KB": 5,
 }
@@ -90,6 +90,8 @@ class JobInfo(TypedDict, total=False):
     error: Optional[str]
     created_at: datetime
     completed_at: Optional[datetime]
+    owner_id: Optional[str]
+    file_id: Optional[str]
 
 
 UPLOAD_JOBS: Dict[str, JobInfo] = {}
@@ -98,12 +100,9 @@ bm25 = None
 
 
 # ============================================================================
-# IN-MEMORY STORES (chat history + uploaded file registry)
+# IN-MEMORY STORES
 # ============================================================================
-# Chat sessions: { session_id: { "id": str, "title": str, "messages": [...], "created_at": str, "updated_at": str } }
 CHAT_SESSIONS: Dict[str, dict] = {}
-
-# Uploaded files registry: { file_id: { "id": str, "name": str, "file_type": str, "size_mb": float, "status": str, "job_id": str, "uploaded_at": str } }
 UPLOADED_FILES: Dict[str, dict] = {}
 
 
@@ -132,6 +131,77 @@ bedrock = _make_bedrock_client()
 
 
 # ============================================================================
+# HELPERS
+# ============================================================================
+def _normalize_owner_id(user_id: Optional[str]) -> str:
+    return user_id or "anonymous"
+
+
+def _filter_files_for_owner(user_id: Optional[str]) -> List[dict]:
+    owner_id = _normalize_owner_id(user_id)
+    return [
+        f for f in UPLOADED_FILES.values()
+        if f.get("owner_id", "anonymous") == owner_id
+    ]
+
+
+def _get_active_indexed_file_ids(user_id: Optional[str]) -> Set[str]:
+    owner_id = _normalize_owner_id(user_id)
+    return {
+        f["id"]
+        for f in UPLOADED_FILES.values()
+        if f.get("owner_id", "anonymous") == owner_id and f.get("status") == "indexed"
+    }
+
+
+def _delete_physical_uploads_for_file(filename: str, job_id: Optional[str] = None) -> int:
+    deleted = 0
+    try:
+        upload_dir = settings.UPLOAD_DIR
+        if not upload_dir.exists():
+            return 0
+
+        for f in upload_dir.iterdir():
+            if not f.is_file():
+                continue
+            matched = False
+            if job_id and f.name.startswith(f"{job_id}_"):
+                matched = True
+            elif filename and (f.name == filename or filename in f.name):
+                matched = True
+
+            if matched:
+                try:
+                    f.unlink(missing_ok=True)
+                    deleted += 1
+                except Exception as e:
+                    logger.warning("Could not delete upload file %s: %s", f.name, e)
+    except Exception as e:
+        logger.warning("Physical upload cleanup failed for %s: %s", filename, e)
+    return deleted
+
+
+def _remove_file_references_from_sessions(filename: str, file_id: Optional[str] = None) -> int:
+    updated = 0
+    for session in CHAT_SESSIONS.values():
+        changed = False
+        for msg in session.get("messages", []):
+            sources = msg.get("sources")
+            if not isinstance(sources, dict):
+                continue
+            docs = sources.get("docs")
+            if isinstance(docs, list):
+                new_docs = [d for d in docs if d != filename]
+                if new_docs != docs:
+                    sources["docs"] = new_docs
+                    changed = True
+        if changed:
+            session["updated_at"] = datetime.now(timezone.utc).isoformat()
+            updated += 1
+    return updated
+
+
+# ============================================================================
 # LIFESPAN
 # ============================================================================
 @asynccontextmanager
@@ -150,7 +220,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Acadia's Log IQ API",
     description="AI log analysis — Hybrid Search + Re-ranking",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -165,7 +235,6 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:8000",
-        # EC2: allow all origins (tighten in production)
         "*",
     ],
     allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -174,7 +243,6 @@ app.add_middleware(
 
 
 def verify_api_key(x_api_key: Optional[str] = Header(default=None, alias="X-API-Key")) -> bool:
-    """Legacy API key check — still works when Clerk is disabled."""
     if settings.API_KEY:
         if not x_api_key or x_api_key != settings.API_KEY:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
@@ -185,22 +253,10 @@ async def auth_dependency(
     request: Request,
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> Optional[str]:
-    """
-    Combined authentication dependency.
-
-    Priority:
-    1. If CLERK_ENABLED=true → require Clerk JWT Bearer token
-    2. Else if API_KEY is set → require X-API-Key header
-    3. Else → open access (no auth)
-
-    Returns: Clerk user_id (str) or None
-    """
     if is_clerk_enabled():
-        # Clerk mode: require Bearer token
         user_id = await clerk_auth_dependency(request)
         return user_id
     else:
-        # Legacy mode: API key check
         verify_api_key(x_api_key)
         return None
 
@@ -212,12 +268,15 @@ class Question(BaseModel):
     q: str = Field(min_length=1, max_length=1000)
     session_id: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
+
     @field_validator("q")
     @classmethod
     def validate_q(cls, v):
         v = (v or "").strip()
-        if not v: raise ValueError("Empty")
+        if not v:
+            raise ValueError("Empty")
         return v
+
 
 class UploadResponse(BaseModel):
     job_id: str
@@ -225,6 +284,7 @@ class UploadResponse(BaseModel):
     message: str
     file_hash: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
+
 
 class JobStatus(BaseModel):
     job_id: str
@@ -241,6 +301,7 @@ class JobStatus(BaseModel):
     completed_at: Optional[datetime] = None
     model_config = ConfigDict(extra="ignore")
 
+
 class AnswerResponse(BaseModel):
     answer: str
     sources: List[str]
@@ -250,11 +311,13 @@ class AnswerResponse(BaseModel):
     session_id: Optional[str] = None
     model_config = ConfigDict(extra="ignore")
 
+
 class ChatMessage(BaseModel):
     role: str
     content: str
     sources: Optional[Dict] = None
     timestamp: str
+
 
 class ChatSession(BaseModel):
     id: str
@@ -262,6 +325,7 @@ class ChatSession(BaseModel):
     messages: List[ChatMessage]
     created_at: str
     updated_at: str
+
 
 class FileInfo(BaseModel):
     id: str
@@ -271,6 +335,7 @@ class FileInfo(BaseModel):
     status: str
     job_id: Optional[str] = None
     uploaded_at: str
+    owner_id: Optional[str] = None
 
 
 # ============================================================================
@@ -294,7 +359,7 @@ def safe_embed(text: str) -> Optional[List[float]]:
 
 
 # ============================================================================
-# LLM GENERATION — MISTRAL 7B (32K) WITH HARD TRUNCATION
+# LLM GENERATION
 # ============================================================================
 def estimate_tokens(text: str) -> int:
     return len(text) // CHARS_PER_TOKEN
@@ -347,14 +412,20 @@ def safe_generate(prompt: str, max_tokens: int = None) -> str:
 
 
 # ============================================================================
-# HYBRID SEARCH: VECTOR + BM25 + RECIPROCAL RANK FUSION
+# HYBRID SEARCH
 # ============================================================================
 def hybrid_search(
-    query: str, query_embedding: List[float], file_type: str, n_results: int = 10,
+    query: str,
+    query_embedding: List[float],
+    file_type: str,
+    n_results: int = 10,
+    allowed_file_ids: Optional[Set[str]] = None,
+    owner_id: Optional[str] = None,
 ) -> List[Tuple[str, str, Dict, float]]:
     v_weight = HYBRID_CONFIG["VECTOR_WEIGHT"]
     b_weight = HYBRID_CONFIG["BM25_WEIGHT"]
     rrf_k = 60
+    owner_id = _normalize_owner_id(owner_id)
 
     vector_results = {}
     try:
@@ -363,14 +434,28 @@ def hybrid_search(
             n_results=HYBRID_CONFIG["VECTOR_CANDIDATES"],
             where={"file_type": file_type},
         )
-        for i, doc_id in enumerate((cr.get("ids") or [[]])[0]):
-            docs = (cr.get("documents") or [[]])[0]
-            metas = (cr.get("metadatas") or [[]])[0]
-            dists = (cr.get("distances") or [[]])[0]
+
+        ids = (cr.get("ids") or [[]])[0]
+        docs = (cr.get("documents") or [[]])[0]
+        metas = (cr.get("metadatas") or [[]])[0]
+        dists = (cr.get("distances") or [[]])[0]
+
+        rank = 0
+        for i, doc_id in enumerate(ids):
+            meta = metas[i] if i < len(metas) else {}
+            meta_file_id = meta.get("file_id")
+            meta_owner_id = meta.get("owner_id", "anonymous")
+
+            if allowed_file_ids is not None and meta_file_id not in allowed_file_ids:
+                continue
+            if meta_owner_id != owner_id:
+                continue
+
+            rank += 1
             vector_results[doc_id] = {
                 "text": docs[i] if i < len(docs) else "",
-                "metadata": metas[i] if i < len(metas) else {},
-                "rank": i + 1,
+                "metadata": meta,
+                "rank": rank,
                 "similarity": max(0, 1 - (dists[i] if i < len(dists) else 1.0)),
             }
     except Exception as e:
@@ -379,13 +464,30 @@ def hybrid_search(
     bm25_results = {}
     try:
         if bm25 and bm25.size > 0:
-            for i, (doc_id, text, meta, score) in enumerate(
-                bm25.search(query, n_results=HYBRID_CONFIG["BM25_CANDIDATES"], file_type=file_type)
-            ):
+            raw_bm25 = bm25.search(
+                query,
+                n_results=HYBRID_CONFIG["BM25_CANDIDATES"],
+                file_type=file_type
+            )
+            rank = 0
+            for doc_id, text, meta, score in raw_bm25:
+                meta_file_id = meta.get("file_id")
+                meta_owner_id = meta.get("owner_id", "anonymous")
+
+                if allowed_file_ids is not None and meta_file_id not in allowed_file_ids:
+                    continue
+                if meta_owner_id != owner_id:
+                    continue
+
+                rank += 1
                 bm25_results[doc_id] = {
-                    "text": text, "metadata": meta,
-                    "rank": i + 1, "bm25_score": score,
+                    "text": text,
+                    "metadata": meta,
+                    "rank": rank,
+                    "bm25_score": score,
                 }
+                if rank >= HYBRID_CONFIG["BM25_CANDIDATES"]:
+                    break
     except Exception as e:
         logger.warning("BM25 search failed: %s", e)
 
@@ -409,14 +511,20 @@ def hybrid_search(
     ]
 
     logger.info(
-        "Hybrid(%s): vec=%d, bm25=%d, merged=%d, returned=%d",
-        file_type, len(vector_results), len(bm25_results), len(combined), len(results),
+        "Hybrid(%s): vec=%d, bm25=%d, merged=%d, returned=%d, allowed_files=%d, owner=%s",
+        file_type,
+        len(vector_results),
+        len(bm25_results),
+        len(combined),
+        len(results),
+        len(allowed_file_ids or []),
+        owner_id,
     )
     return results
 
 
 # ============================================================================
-# RE-RANKING VIA LLM
+# RE-RANKING
 # ============================================================================
 def rerank_chunks(
     query: str, chunks: List[Tuple[str, str, Dict, float]], top_k: int = 6,
@@ -488,69 +596,141 @@ def truncate_chunk(text: str, max_chars: int) -> str:
     return t + "\n[... truncated ...]"
 
 
+# def assemble_context(
+#     ranked: List[Tuple[str, str, Dict, float]],
+#     max_total_chars: int,
+#     max_sources: int = 3,
+# ) -> Tuple[str, List[str]]:
+#     """
+#     Build context from ranked chunks.
+
+#     Only sources from included chunks are considered.
+#     Source list is stricter:
+#     - aggregate included score per source
+#     - keep max 3
+#     - if top source strongly dominates, return only top source
+#     """
+#     max_chunk = TOKEN_BUDGET["MAX_SINGLE_CHUNK_CHARS"]
+#     if not ranked:
+#         return "", []
+
+#     parts = []
+#     included_source_scores: Dict[str, float] = {}
+#     total = 0
+
+#     for _, text, meta, score in ranked:
+#         if not text or not text.strip():
+#             continue
+
+#         chunk = truncate_chunk(text.strip(), max_chunk)
+#         src = meta.get("source", "unknown")
+#         entry = f"[Source: {src}]\n{chunk}"
+
+#         if total + len(entry) > max_total_chars:
+#             remaining = max_total_chars - total
+#             if remaining > 300:
+#                 parts.append(f"[Source: {src}]\n{truncate_chunk(chunk, remaining - 60)}")
+#                 included_source_scores[src] = included_source_scores.get(src, 0.0) + score
+#             break
+
+#         parts.append(entry)
+#         included_source_scores[src] = included_source_scores.get(src, 0.0) + score
+#         total += len(entry)
+
+#     if not included_source_scores:
+#         return "\n\n".join(parts), []
+
+#     ranked_sources = sorted(included_source_scores.items(), key=lambda x: x[1], reverse=True)
+#     final_sources = []
+
+#     if len(ranked_sources) == 1:
+#         final_sources = [ranked_sources[0][0]]
+#     else:
+#         top_name, top_score = ranked_sources[0]
+#         second_score = ranked_sources[1][1] if len(ranked_sources) > 1 else 0.0
+
+#         # If top source clearly dominates, show only it.
+#         if second_score <= 0 or top_score >= second_score * 2.0:
+#             final_sources = [top_name]
+#         else:
+#             threshold = top_score * 0.60
+#             final_sources = [src for src, score in ranked_sources if score >= threshold][:max_sources]
+#             if not final_sources:
+#                 final_sources = [top_name]
+
+#     return "\n\n".join(parts), final_sources
+
 def assemble_context(
-    ranked: List[Tuple[str, str, Dict, float]], max_total_chars: int,
+    ranked: List[Tuple[str, str, Dict, float]],
+    max_total_chars: int,
+    max_sources: int = 3,
 ) -> Tuple[str, List[str]]:
     """
-    Build context from ranked chunks. Returns (context_str, sources).
+    Build context from ranked chunks.
 
-    Source filtering strategy:
-    1. Aggregate total relevance scores per source document
-    2. Only documents whose aggregate score is >= 25% of the top
-       document's aggregate score appear in the Sources list
-    3. All chunks are still sent to the LLM for context, but only
-       truly relevant documents are shown to the user as sources
-
-    This handles RRF's compressed score range by looking at the
-    cumulative contribution of each document, not individual chunks.
+    Only sources from included chunks are considered.
+    Source selection is strict:
+    - aggregate included score per source
+    - prefer dominant source
+    - include secondary source only if it is strongly relevant
     """
     max_chunk = TOKEN_BUDGET["MAX_SINGLE_CHUNK_CHARS"]
     if not ranked:
         return "", []
 
-    # Step 1: Aggregate scores per source document
-    source_scores: Dict[str, float] = {}
+    parts = []
+    included_source_scores: Dict[str, float] = {}
+    included_source_counts: Dict[str, int] = {}
+    total = 0
+
     for _, text, meta, score in ranked:
         if not text or not text.strip():
             continue
-        src = meta.get("source", "unknown")
-        source_scores[src] = source_scores.get(src, 0.0) + score
 
-    # Step 2: Determine which sources are "relevant"
-    if source_scores:
-        top_doc_score = max(source_scores.values())
-        relevant_sources = {
-            src for src, total in source_scores.items()
-            if total >= top_doc_score * 0.25
-        }
-    else:
-        relevant_sources = set()
-
-    logger.info("Source scores: %s | Relevant: %s",
-                {s: f"{v:.6f}" for s, v in source_scores.items()},
-                relevant_sources)
-
-    # Step 3: Assemble context (all chunks for LLM, filtered sources for UI)
-    parts, sources, total = [], set(), 0
-    for i, (_, text, meta, score) in enumerate(ranked):
-        if not text or not text.strip():
-            continue
         chunk = truncate_chunk(text.strip(), max_chunk)
         src = meta.get("source", "unknown")
         entry = f"[Source: {src}]\n{chunk}"
+
         if total + len(entry) > max_total_chars:
             remaining = max_total_chars - total
             if remaining > 300:
                 parts.append(f"[Source: {src}]\n{truncate_chunk(chunk, remaining - 60)}")
-                if src in relevant_sources:
-                    sources.add(src)
+                included_source_scores[src] = included_source_scores.get(src, 0.0) + score
+                included_source_counts[src] = included_source_counts.get(src, 0) + 1
             break
+
         parts.append(entry)
-        if src in relevant_sources:
-            sources.add(src)
+        included_source_scores[src] = included_source_scores.get(src, 0.0) + score
+        included_source_counts[src] = included_source_counts.get(src, 0) + 1
         total += len(entry)
 
-    return "\n\n".join(parts), sorted(s for s in sources if s)
+    if not included_source_scores:
+        return "\n\n".join(parts), []
+
+    ranked_sources = sorted(
+        included_source_scores.items(),
+        key=lambda x: (x[1], included_source_counts.get(x[0], 0)),
+        reverse=True,
+    )
+
+    top_name, top_score = ranked_sources[0]
+    top_count = included_source_counts.get(top_name, 0)
+
+    # Default: only show the top source
+    final_sources = [top_name]
+
+    # Allow a second source only if it is genuinely competitive
+    if len(ranked_sources) > 1:
+        second_name, second_score = ranked_sources[1]
+        second_count = included_source_counts.get(second_name, 0)
+
+        strong_second_score = second_score >= top_score * 0.80
+        strong_second_count = second_count >= top_count
+
+        if strong_second_score or strong_second_count:
+            final_sources.append(second_name)
+
+    return "\n\n".join(parts), final_sources[:max_sources]
 
 
 # ============================================================================
@@ -565,7 +745,7 @@ def calculate_file_hash(fp: Path) -> str:
 
 
 # ============================================================================
-# TEXT EXTRACTION (PDF, DOCX)
+# TEXT EXTRACTION
 # ============================================================================
 def extract_text_from_pdf(fp: Path) -> str:
     try:
@@ -582,6 +762,7 @@ def extract_text_from_pdf(fp: Path) -> str:
         return ""
     except ImportError:
         pass
+
     try:
         import pdfplumber
         parts = []
@@ -612,8 +793,10 @@ def extract_text_from_docx(fp: Path) -> str:
 
 def extract_text(fp: Path) -> str:
     ext = fp.suffix.lower()
-    if ext == ".pdf": return extract_text_from_pdf(fp)
-    if ext == ".docx": return extract_text_from_docx(fp)
+    if ext == ".pdf":
+        return extract_text_from_pdf(fp)
+    if ext == ".docx":
+        return extract_text_from_docx(fp)
     return fp.read_text(encoding="utf-8", errors="ignore")
 
 
@@ -625,17 +808,20 @@ def iter_text_chunks(text, max_chars=None, lines_per=None, overlap=None):
     lines_per = lines_per or CHUNK_CONFIG["LINES_PER_CHUNK"]
     overlap = overlap or CHUNK_CONFIG["OVERLAP_LINES"]
     lines = text.splitlines(keepends=True)
-    if not lines: return
+    if not lines:
+        return
     buf, sz = [], 0
     for ln in lines:
-        buf.append(ln); sz += len(ln)
+        buf.append(ln)
+        sz += len(ln)
         if len(buf) >= lines_per or sz >= max_chars:
             yield "".join(buf)
             if overlap > 0 and len(buf) > overlap:
                 buf = buf[-overlap:]
                 sz = sum(len(l) for l in buf)
             else:
-                buf.clear(); sz = 0
+                buf.clear()
+                sz = 0
     if buf:
         yield "".join(buf)
 
@@ -646,14 +832,17 @@ def iter_line_chunks(fp: Path, lines_per=None):
     if ext in (".pdf", ".docx"):
         try:
             text = extract_text(fp)
-            if not text or not text.strip(): return
+            if not text or not text.strip():
+                return
             logger.info("Extracted %d chars from %s", len(text), fp.name)
             n = 0
             for c in iter_text_chunks(text, lines_per=lines_per):
-                n += 1; yield c
+                n += 1
+                yield c
             logger.info("%d chunks from %s", n, fp.name)
         except RuntimeError as e:
-            logger.error("Extraction: %s", e); raise
+            logger.error("Extraction: %s", e)
+            raise
         except Exception as e:
             logger.exception("Failed: %s", e)
         return
@@ -667,15 +856,25 @@ def iter_line_chunks(fp: Path, lines_per=None):
 
 
 # ============================================================================
-# INDEX JOB — UPDATES BOTH CHROMA + BM25
+# INDEX JOB
 # ============================================================================
-async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str, file_id: str):
+async def index_file_job(
+    job_id: str,
+    fp: Path,
+    filename: str,
+    file_type: str,
+    file_id: str,
+    owner_id: Optional[str],
+):
+    owner_id = _normalize_owner_id(owner_id)
+
     try:
         job = UPLOAD_JOBS.get(job_id)
-        if not job: return
+        if not job:
+            return
+
         job["status"] = "running"
 
-        # Update file registry
         if file_id in UPLOADED_FILES:
             UPLOADED_FILES[file_id]["status"] = "processing"
 
@@ -684,23 +883,39 @@ async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str, f
         bm25_ids, bm25_docs, bm25_metas = [], [], []
 
         for chunk in iter_line_chunks(fp):
-            if not chunk or not chunk.strip(): continue
+            if not chunk or not chunk.strip():
+                continue
+
             total += 1
             emb = safe_embed(chunk)
-            if not emb: continue
-            cid = f"{job_id}-{ok}"
-            ok += 1
+            if not emb:
+                continue
+
+            cid = f"{file_id}:{job_id}:{ok}"
             meta = {
-                "source": filename, "file_type": file_type,
-                "job_id": job_id, "chunk_index": ok - 1,
+                "file_id": file_id,
+                "owner_id": owner_id,
+                "source": filename,
+                "file_type": file_type,
+                "job_id": job_id,
+                "chunk_index": ok,
                 "char_count": len(chunk),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-            b_ids.append(cid); b_emb.append(emb)
-            b_doc.append(chunk); b_meta.append(meta)
-            bm25_ids.append(cid); bm25_docs.append(chunk); bm25_metas.append(meta)
 
-            if ok % 10 == 0: job["processed_chunks"] = ok
+            b_ids.append(cid)
+            b_emb.append(emb)
+            b_doc.append(chunk)
+            b_meta.append(meta)
+
+            bm25_ids.append(cid)
+            bm25_docs.append(chunk)
+            bm25_metas.append(meta)
+
+            ok += 1
+            if ok % 10 == 0:
+                job["processed_chunks"] = ok
+
             if len(b_emb) >= settings.BATCH_SIZE:
                 coll.add(ids=b_ids, embeddings=b_emb, metadatas=b_meta, documents=b_doc)
                 b_ids, b_emb, b_meta, b_doc = [], [], [], []
@@ -712,14 +927,19 @@ async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str, f
             bm25.add_documents_batch(bm25_ids, bm25_docs, bm25_metas)
             logger.info("BM25 +%d (total: %d)", len(bm25_ids), bm25.size)
 
-        try: fp.unlink(missing_ok=True)
-        except: pass
+        try:
+            fp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-        job.update({"status": "done", "processed_chunks": ok,
-                     "total_chunks": total, "successful_chunks": ok,
-                     "completed_at": datetime.now(timezone.utc)})
+        job.update({
+            "status": "done",
+            "processed_chunks": ok,
+            "total_chunks": total,
+            "successful_chunks": ok,
+            "completed_at": datetime.now(timezone.utc),
+        })
 
-        # Update file registry
         if file_id in UPLOADED_FILES:
             UPLOADED_FILES[file_id]["status"] = "indexed"
 
@@ -729,13 +949,16 @@ async def index_file_job(job_id: str, fp: Path, filename: str, file_type: str, f
         logger.exception("Job failed %s: %s", job_id, e)
         if job_id in UPLOAD_JOBS:
             UPLOAD_JOBS[job_id].update({
-                "status": "failed", "error": str(e),
+                "status": "failed",
+                "error": str(e),
                 "completed_at": datetime.now(timezone.utc),
             })
         if file_id in UPLOADED_FILES:
             UPLOADED_FILES[file_id]["status"] = "failed"
-        try: fp.unlink(missing_ok=True)
-        except: pass
+        try:
+            fp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ============================================================================
@@ -759,8 +982,10 @@ async def log_requests(request: Request, call_next):
 async def health_check():
     cc = 0
     try:
-        if coll: cc = coll.count()
-    except: pass
+        if coll:
+            cc = coll.count()
+    except Exception:
+        pass
     return {
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -785,11 +1010,6 @@ async def health_check():
 # ============================================================================
 @app.get("/me")
 async def get_current_user(request: Request, user_id: Optional[str] = Depends(auth_dependency)):
-    """
-    Returns current user info.
-    - If Clerk enabled: returns Clerk user_id from JWT
-    - If Clerk disabled: returns anonymous
-    """
     if is_clerk_enabled() and user_id:
         payload = getattr(request.state, "clerk_payload", {})
         return {
@@ -859,8 +1079,10 @@ async def reset_all(user_id: Optional[str] = Depends(auth_dependency)):
 
     verify_count = 0
     try:
-        if coll: verify_count = coll.count()
-    except: pass
+        if coll:
+            verify_count = coll.count()
+    except Exception:
+        pass
 
     if errors:
         return {
@@ -891,9 +1113,10 @@ async def reset_all(user_id: Optional[str] = Depends(auth_dependency)):
 # ROUTES — UPLOAD
 # ============================================================================
 @app.post("/upload", response_model=UploadResponse)
-@limiter.limit("10/minute")
+@limiter.limit("100/minute")
 async def upload(
-    request: Request, background_tasks: BackgroundTasks,
+    request: Request,
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     file_type: str = Query(default="kb", pattern="^(kb)$"),
     user_id: Optional[str] = Depends(auth_dependency),
@@ -902,9 +1125,11 @@ async def upload(
     if not ext or ext not in settings.ALLOWED_FILE_TYPES:
         raise HTTPException(400, f"Type '{ext}' not allowed. Allowed: {settings.ALLOWED_FILE_TYPES}")
 
+    owner_id = _normalize_owner_id(user_id)
     job_id = uuid.uuid4().hex
     file_id = uuid.uuid4().hex
     fp = settings.UPLOAD_DIR / f"{job_id}_{Path(file.filename).name}"
+
     content = await file.read()
     size_mb = len(content) / (1024 * 1024)
     if size_mb > settings.MAX_FILE_SIZE_MB:
@@ -914,14 +1139,20 @@ async def upload(
     fh = calculate_file_hash(fp)
 
     UPLOAD_JOBS[job_id] = {
-        "job_id": job_id, "status": "queued",
-        "processed_chunks": 0, "total_chunks": 0, "successful_chunks": 0,
-        "file": file.filename, "file_type": file_type,
-        "file_size_mb": size_mb, "file_hash": fh,
+        "job_id": job_id,
+        "status": "queued",
+        "processed_chunks": 0,
+        "total_chunks": 0,
+        "successful_chunks": 0,
+        "file": file.filename,
+        "file_type": file_type,
+        "file_size_mb": size_mb,
+        "file_hash": fh,
         "created_at": datetime.now(timezone.utc),
+        "owner_id": owner_id,
+        "file_id": file_id,
     }
 
-    # Register file
     UPLOADED_FILES[file_id] = {
         "id": file_id,
         "name": file.filename,
@@ -930,17 +1161,31 @@ async def upload(
         "status": "uploading",
         "job_id": job_id,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        "owner_id": owner_id,
     }
 
-    background_tasks.add_task(index_file_job, job_id, fp, file.filename, file_type, file_id)
-    logger.info("Upload: %s (%.1fMB, %s)", file.filename, size_mb, file_type)
-    return UploadResponse(job_id=job_id, file_id=file_id, message="Uploaded. Processing started.", file_hash=fh)
+    background_tasks.add_task(index_file_job, job_id, fp, file.filename, file_type, file_id, owner_id)
+
+    logger.info("Upload: %s (%.1fMB, %s, owner=%s, file_id=%s)", file.filename, size_mb, file_type, owner_id, file_id)
+
+    return UploadResponse(
+        job_id=job_id,
+        file_id=file_id,
+        message="Uploaded. Processing started.",
+        file_hash=fh,
+    )
 
 
 @app.get("/upload_status/{job_id}", response_model=JobStatus)
 async def upload_status(job_id: str, user_id: Optional[str] = Depends(auth_dependency)):
     job = UPLOAD_JOBS.get(job_id)
-    if not job: raise HTTPException(404, "Job not found")
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    owner_id = _normalize_owner_id(user_id)
+    if job.get("owner_id", "anonymous") != owner_id:
+        raise HTTPException(404, "Job not found")
+
     return JobStatus(**job)
 
 
@@ -949,8 +1194,11 @@ async def upload_status(job_id: str, user_id: Optional[str] = Depends(auth_depen
 # ============================================================================
 @app.get("/files")
 async def list_files(user_id: Optional[str] = Depends(auth_dependency)):
-    """List all uploaded files with their status."""
-    files = sorted(UPLOADED_FILES.values(), key=lambda x: x["uploaded_at"], reverse=True)
+    files = sorted(
+        _filter_files_for_owner(user_id),
+        key=lambda x: x["uploaded_at"],
+        reverse=True,
+    )
     return {"files": files, "total": len(files)}
 
 
@@ -958,62 +1206,78 @@ async def list_files(user_id: Optional[str] = Depends(auth_dependency)):
 async def delete_file(file_id: str, user_id: Optional[str] = Depends(auth_dependency)):
     """
     Fully delete a file and all its indexed data:
-    1. Remove all chunks from ChromaDB (vector store)
-    2. Remove all chunks from BM25 (keyword index)
-    3. Remove physical file from uploads directory (if still there)
-    4. Remove from file registry
+    1. Remove all chunks from ChromaDB by file_id
+    2. Remove all chunks from BM25
+    3. Remove physical upload file if still present
+    4. Remove file registry + job registry
+    5. Remove old source references from chat sessions
     """
     if file_id not in UPLOADED_FILES:
         raise HTTPException(404, "File not found")
 
     file_info = UPLOADED_FILES[file_id]
+    owner_id = _normalize_owner_id(user_id)
+    if file_info.get("owner_id", "anonymous") != owner_id:
+        raise HTTPException(404, "File not found")
+
     filename = file_info["name"]
     job_id = file_info.get("job_id")
+
     deleted_chunks = 0
+    bm25_removed = 0
+    deleted_files = 0
+    sessions_updated = 0
     errors = []
 
-    # 1. Delete from ChromaDB — find all chunks with this source filename
+    # 1. Delete from Chroma by exact file_id
     try:
         if coll:
-            # ChromaDB where filter to find chunks from this file
-            results = coll.get(
-                where={"source": filename},
-                include=[],
-            )
-            chunk_ids = results.get("ids", [])
+            results = coll.get(where={"file_id": file_id}, include=[])
+            chunk_ids = results.get("ids", []) or []
             if chunk_ids:
                 coll.delete(ids=chunk_ids)
                 deleted_chunks = len(chunk_ids)
-                logger.info("DELETE FILE: Removed %d chunks from ChromaDB for '%s'", deleted_chunks, filename)
+            logger.info(
+                "DELETE FILE: Removed %d chunks from ChromaDB for file_id=%s (%s)",
+                deleted_chunks, file_id, filename
+            )
     except Exception as e:
-        logger.exception("DELETE FILE: ChromaDB cleanup failed for '%s': %s", filename, e)
+        logger.exception("DELETE FILE: Chroma cleanup failed for '%s': %s", filename, e)
         errors.append(f"ChromaDB: {e}")
 
-    # 2. Delete from BM25 index
-    bm25_removed = 0
+    # 2. Delete from BM25
     try:
         if bm25:
-            bm25_removed = bm25.remove_documents_by_source(filename)
+            if hasattr(bm25, "remove_documents_by_file_id"):
+                bm25_removed = bm25.remove_documents_by_file_id(file_id)
+            elif hasattr(bm25, "remove_documents_by_source"):
+                bm25_removed = bm25.remove_documents_by_source(filename)
             logger.info("DELETE FILE: Removed %d docs from BM25 for '%s'", bm25_removed, filename)
     except Exception as e:
         logger.exception("DELETE FILE: BM25 cleanup failed for '%s': %s", filename, e)
         errors.append(f"BM25: {e}")
 
-    # 3. Delete physical file from uploads directory (if it still exists)
+    # 3. Delete physical file
     try:
-        upload_dir = settings.UPLOAD_DIR
-        if upload_dir.exists():
-            for f in upload_dir.iterdir():
-                if f.is_file() and filename in f.name:
-                    f.unlink()
-                    logger.info("DELETE FILE: Removed file '%s' from disk", f.name)
+        deleted_files = _delete_physical_uploads_for_file(filename, job_id)
+        logger.info("DELETE FILE: Removed %d upload file(s) for '%s'", deleted_files, filename)
     except Exception as e:
         logger.warning("DELETE FILE: Disk cleanup failed: %s", e)
 
-    # 4. Remove from registry and jobs
-    del UPLOADED_FILES[file_id]
+    # 4. Remove from registries
+    try:
+        del UPLOADED_FILES[file_id]
+    except KeyError:
+        pass
+
     if job_id and job_id in UPLOAD_JOBS:
         del UPLOAD_JOBS[job_id]
+
+    # 5. Remove from session source references
+    try:
+        sessions_updated = _remove_file_references_from_sessions(filename, file_id)
+    except Exception as e:
+        logger.warning("DELETE FILE: Session cleanup failed: %s", e)
 
     if errors:
         return {
@@ -1022,6 +1286,8 @@ async def delete_file(file_id: str, user_id: Optional[str] = Depends(auth_depend
             "filename": filename,
             "deleted_chunks": deleted_chunks,
             "bm25_removed": bm25_removed,
+            "deleted_files": deleted_files,
+            "sessions_updated": sessions_updated,
             "errors": errors,
         }
 
@@ -1031,6 +1297,8 @@ async def delete_file(file_id: str, user_id: Optional[str] = Depends(auth_depend
         "filename": filename,
         "deleted_chunks": deleted_chunks,
         "bm25_removed": bm25_removed,
+        "deleted_files": deleted_files,
+        "sessions_updated": sessions_updated,
     }
 
 
@@ -1039,27 +1307,38 @@ async def delete_file(file_id: str, user_id: Optional[str] = Depends(auth_depend
 # ============================================================================
 @app.get("/chat/sessions")
 async def list_sessions(user_id: Optional[str] = Depends(auth_dependency)):
-    """List all chat sessions (sorted by most recent)."""
+    owner_id = _normalize_owner_id(user_id)
     sessions = sorted(
-        [{"id": s["id"], "title": s["title"], "updated_at": s["updated_at"], "message_count": len(s["messages"])}
-         for s in CHAT_SESSIONS.values()],
-        key=lambda x: x["updated_at"], reverse=True,
+        [
+            {
+                "id": s["id"],
+                "title": s["title"],
+                "updated_at": s["updated_at"],
+                "message_count": len(s["messages"]),
+            }
+            for s in CHAT_SESSIONS.values()
+            if s.get("owner_id", "anonymous") == owner_id
+        ],
+        key=lambda x: x["updated_at"],
+        reverse=True,
     )
     return {"sessions": sessions}
 
 
 @app.get("/chat/sessions/{session_id}")
 async def get_session(session_id: str, user_id: Optional[str] = Depends(auth_dependency)):
-    """Get full chat session with messages."""
     session = CHAT_SESSIONS.get(session_id)
-    if not session:
+    owner_id = _normalize_owner_id(user_id)
+    if not session or session.get("owner_id", "anonymous") != owner_id:
         raise HTTPException(404, "Session not found")
     return session
 
 
 @app.delete("/chat/sessions/{session_id}")
 async def delete_session(session_id: str, user_id: Optional[str] = Depends(auth_dependency)):
-    if session_id not in CHAT_SESSIONS:
+    session = CHAT_SESSIONS.get(session_id)
+    owner_id = _normalize_owner_id(user_id)
+    if not session or session.get("owner_id", "anonymous") != owner_id:
         raise HTTPException(404, "Session not found")
     del CHAT_SESSIONS[session_id]
     return {"status": "deleted", "session_id": session_id}
@@ -1067,14 +1346,22 @@ async def delete_session(session_id: str, user_id: Optional[str] = Depends(auth_
 
 @app.delete("/chat/sessions")
 async def delete_all_sessions(user_id: Optional[str] = Depends(auth_dependency)):
-    count = len(CHAT_SESSIONS)
-    CHAT_SESSIONS.clear()
-    return {"status": "cleared", "deleted_count": count}
+    owner_id = _normalize_owner_id(user_id)
+    to_delete = [sid for sid, s in CHAT_SESSIONS.items() if s.get("owner_id", "anonymous") == owner_id]
+    for sid in to_delete:
+        del CHAT_SESSIONS[sid]
+    return {"status": "cleared", "deleted_count": len(to_delete)}
 
 
-def _save_message_to_session(session_id: Optional[str], role: str, content: str, sources: Optional[Dict] = None) -> str:
-    """Save a message to a chat session. Creates session if needed. Returns session_id."""
+def _save_message_to_session(
+    session_id: Optional[str],
+    role: str,
+    content: str,
+    sources: Optional[Dict] = None,
+    owner_id: Optional[str] = None,
+) -> str:
     now = datetime.now(timezone.utc).isoformat()
+    owner_id = _normalize_owner_id(owner_id)
 
     if not session_id or session_id not in CHAT_SESSIONS:
         session_id = uuid.uuid4().hex
@@ -1085,6 +1372,7 @@ def _save_message_to_session(session_id: Optional[str], role: str, content: str,
             "messages": [],
             "created_at": now,
             "updated_at": now,
+            "owner_id": owner_id,
         }
 
     msg = {"role": role, "content": content, "timestamp": now}
@@ -1103,9 +1391,8 @@ def _save_message_to_session(session_id: Optional[str], role: str, content: str,
 @limiter.limit("30/minute")
 async def ask(request: Request, req: Question, user_id: Optional[str] = Depends(auth_dependency)):
     """
-    RAG pipeline: Hybrid Search → Re-Rank → Budget Assembly → Generate.
-
-    Searches all uploaded documents (single unified search).
+    Searches only currently active indexed files for this user.
+    Deleted files are excluded even if old chunks exist elsewhere.
     """
     import time
     start = time.perf_counter()
@@ -1113,70 +1400,150 @@ async def ask(request: Request, req: Question, user_id: Optional[str] = Depends(
     if not coll:
         raise HTTPException(503, "Vector store not ready")
 
-    # Save user message to session
-    session_id = _save_message_to_session(req.session_id, "user", req.q)
+    owner_id = _normalize_owner_id(user_id)
+
+    # Save user message
+    session_id = _save_message_to_session(req.session_id, "user", req.q, owner_id=owner_id)
+
+    active_file_ids = _get_active_indexed_file_ids(user_id)
+    if not active_file_ids:
+        answer = "No indexed files are currently available. Please upload a document first."
+        _save_message_to_session(session_id, "assistant", answer, {"docs": []}, owner_id=owner_id)
+        return AnswerResponse(
+            answer=answer,
+            sources=[],
+            confidence=0.0,
+            processing_time_ms=int((time.perf_counter() - start) * 1000),
+            session_id=session_id,
+            context_stats={
+                "search_mode": "hybrid (vector + BM25 + re-ranking)",
+                "active_file_count": 0,
+                "doc_candidates": 0,
+                "doc_after_rerank": 0,
+            },
+        )
 
     q_emb = safe_embed(req.q)
     if not q_emb:
         raise HTTPException(500, "Embedding failed")
 
-    # Single unified search across all documents (type "kb")
-    doc_cands = hybrid_search(req.q, q_emb, "kb", HYBRID_CONFIG["VECTOR_CANDIDATES"])
+    doc_cands = hybrid_search(
+        req.q,
+        q_emb,
+        "kb",
+        HYBRID_CONFIG["VECTOR_CANDIDATES"],
+        allowed_file_ids=active_file_ids,
+        owner_id=owner_id,
+    )
 
-    # Re-rank
-    doc_ranked = rerank_chunks(req.q, doc_cands, HYBRID_CONFIG["RERANK_TOP_K_LOG"] + HYBRID_CONFIG["RERANK_TOP_K_KB"])
+    # Extra hard safety filter
+    doc_cands = [
+        item for item in doc_cands
+        if item[2].get("file_id") in active_file_ids
+        and item[2].get("owner_id", "anonymous") == owner_id
+    ]
 
-    # Assemble context
+    doc_ranked = rerank_chunks(
+        req.q,
+        doc_cands,
+        HYBRID_CONFIG["RERANK_TOP_K_LOG"] 
+    )
+
     max_ctx_chars = TOKEN_BUDGET["MAX_LOG_CONTEXT_CHARS"] + TOKEN_BUDGET["MAX_KB_CONTEXT_CHARS"]
     doc_ctx, doc_src = assemble_context(doc_ranked, max_ctx_chars)
 
     if not doc_ctx:
-        doc_ctx = "No relevant documents found."
+        answer = "I could not find relevant information in the currently uploaded files."
+        ms = int((time.perf_counter() - start) * 1000)
+        _save_message_to_session(session_id, "assistant", answer, {"docs": []}, owner_id=owner_id)
+        return AnswerResponse(
+            answer=answer,
+            sources=[],
+            confidence=0.05,
+            processing_time_ms=ms,
+            session_id=session_id,
+            context_stats={
+                "search_mode": "hybrid (vector + BM25 + re-ranking)",
+                "active_file_count": len(active_file_ids),
+                "doc_candidates": len(doc_cands),
+                "doc_after_rerank": len(doc_ranked),
+                "doc_context_chars": 0,
+            },
+        )
 
-    # Layer 2: combined check
     if len(doc_ctx) > MAX_TOTAL_PROMPT_CHARS - TOKEN_BUDGET["PROMPT_OVERHEAD_CHARS"]:
         doc_ctx = truncate_chunk(doc_ctx, MAX_TOTAL_PROMPT_CHARS - TOKEN_BUDGET["PROMPT_OVERHEAD_CHARS"])
 
     confidence = min(0.3 + len(doc_ranked) * 0.1, 1.0)
 
+#     prompt = f"""You are an expert AI assistant analyzing uploaded documents.
+
+# IMPORTANT RULES:
+# - Use ONLY the document context below.
+# - Ignore any deleted, missing, or previously uploaded files not present in the context.
+# - If the answer is mainly from one document, mention only that document.
+# - In the final answer, be precise and avoid mixing unrelated documents.
+# - If the information is not present in the current uploaded files, clearly say so.
+
+# DOCUMENTS:
+# {doc_ctx}
+
+# USER QUESTION: {req.q}
+
+# Provide a concise, accurate answer based only on the current uploaded documents.
+
+# ANSWER:"""
+
     prompt = f"""You are an expert AI assistant analyzing uploaded documents.
-The document chunks below are ranked by relevance to the question.
+
+IMPORTANT RULES:
+- Use ONLY the document context below.
+- Ignore any deleted, missing, or previously uploaded files not present in the context.
+- If the answer is mainly from one document, rely only on that document.
+- Do NOT mix unrelated documents.
+- If the information is not present in the current uploaded files, clearly say so.
+- Every answer MUST be in bullet-point format.
+- Keep bullets concise, factual, and directly based on the provided document context.
+- Do not add a source section inside the answer. Sources are handled separately.
 
 DOCUMENTS:
 {doc_ctx}
 
 USER QUESTION: {req.q}
 
-Provide a concise, accurate answer based on the documents:
-- Reference specific source documents when possible.
-- If the answer comes from a specific document, mention it.
-- If insufficient info, say what's needed.
+Provide a concise, accurate answer based only on the current uploaded documents.
 
 ANSWER:"""
 
     ptok = estimate_tokens(prompt)
     max_tok = TOKEN_BUDGET["MODEL_MAX_TOKENS"] - TOKEN_BUDGET["MAX_GENERATION_TOKENS"]
-    logger.info("ASK: q='%s' | docs=%d | ~%d tok (limit %d)",
-                req.q[:50], len(doc_ctx), ptok, max_tok)
+    logger.info(
+        "ASK: q='%s' | active_files=%d | cands=%d | reranked=%d | ~%d tok (limit %d)",
+        req.q[:50], len(active_file_ids), len(doc_cands), len(doc_ranked), ptok, max_tok
+    )
 
     answer = safe_generate(prompt)
     ms = int((time.perf_counter() - start) * 1000)
 
-    # Save assistant message to session
     sources_dict = {"docs": doc_src}
-    _save_message_to_session(session_id, "assistant", answer, sources_dict)
+    _save_message_to_session(session_id, "assistant", answer, sources_dict, owner_id=owner_id)
 
     return AnswerResponse(
-        answer=answer, sources=doc_src,
-        confidence=confidence, processing_time_ms=ms,
+        answer=answer,
+        sources=doc_src,
+        confidence=confidence,
+        processing_time_ms=ms,
         session_id=session_id,
         context_stats={
             "search_mode": "hybrid (vector + BM25 + re-ranking)",
+            "active_file_count": len(active_file_ids),
             "doc_candidates": len(doc_cands),
             "doc_after_rerank": len(doc_ranked),
             "doc_context_chars": len(doc_ctx),
-            "prompt_chars": len(prompt), "prompt_tokens": ptok,
-            "max_tokens": max_tok, "headroom": max_tok - ptok,
+            "prompt_chars": len(prompt),
+            "prompt_tokens": ptok,
+            "max_tokens": max_tok,
+            "headroom": max_tok - ptok,
         },
     )
 
@@ -1187,14 +1554,17 @@ ANSWER:"""
 @app.exception_handler(HTTPException)
 async def http_err(request, exc):
     return JSONResponse(exc.status_code, {
-        "error": exc.detail, "path": request.url.path,
+        "error": exc.detail,
+        "path": request.url.path,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
+
 
 @app.exception_handler(Exception)
 async def general_err(request, exc):
     logger.exception("Unhandled: %s", exc)
     return JSONResponse(500, {
-        "error": "Internal server error", "path": request.url.path,
+        "error": "Internal server error",
+        "path": request.url.path,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })

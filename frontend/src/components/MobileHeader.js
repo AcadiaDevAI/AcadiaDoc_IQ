@@ -1,4 +1,3 @@
-import React from "react";
 import { Button } from "antd";
 import { MenuOutlined } from "@ant-design/icons";
 import { SignedIn, UserButton } from "@clerk/clerk-react";
@@ -23,7 +22,7 @@ export default function MobileHeader() {
         <div className="w-6 h-6 rounded-md flex items-center justify-center" style={{ background: "linear-gradient(135deg, #6366f1, #4338ca)" }}>
           <span className="text-white text-[10px] font-bold">A</span>
         </div>
-        <span className="text-sm font-semibold t-text">Acadia Log IQ</span>
+        <span className="text-sm font-semibold t-text">Acadia doc IQ</span>
       </div>
       {CLERK_KEY ? (
         <SignedIn>

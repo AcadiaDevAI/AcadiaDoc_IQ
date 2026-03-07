@@ -211,28 +211,51 @@ export default function Sidebar() {
   return (
     <div className="flex flex-col t-bg-secondary border-r w-[280px] h-screen lg:w-[300px]" style={{ borderColor: "var(--border-color)" }}>
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-4 border-b" style={{ borderColor: "var(--border-color)" }}>
-        <div className="flex items-center gap-2">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center" style={{ background: "linear-gradient(135deg, #6366f1, #4338ca)" }}>
-            <span className="text-white text-sm font-bold">A</span>
-          </div>
-          <div>
-            <h1 className="text-sm font-bold t-text leading-none">Acadia Log IQ</h1>
-            <p className="text-[10px] t-text-muted mt-0.5">Hybrid Search · AI Analysis</p>
-          </div>
-        </div>
-        <Button type="text" icon={<MenuFoldOutlined style={{ color: "var(--text-muted)" }} />} onClick={() => dispatch({ type: "TOGGLE_SIDEBAR" })} size="small" />
-      </div>
+    <div
+  className="flex items-center px-4 py-3 border-b"
+  style={{ borderColor: "var(--border-color)" }}
+>
+  <div className="flex items-center">
+    <div className="h-12 w-[160px] flex items-center overflow-hidden">
+      <img
+        src="/logo.png"
+        alt="Acadia Logo"
+        className="h-full w-auto object-contain"
+      />
+    </div>
+  </div>
+
+  <Button
+    type="text"
+    icon={<MenuFoldOutlined style={{ color: "var(--text-muted)" }} />}
+    onClick={() => dispatch({ type: "TOGGLE_SIDEBAR" })}
+    size="small"
+    className="ml-auto"
+  />
+</div>
 
       {/* New Chat + Theme Toggle */}
       <div className="px-3 pt-3 flex items-center gap-2">
-        <Button type="primary" icon={<PlusOutlined />} onClick={() => dispatch({ type: "NEW_CHAT" })} block className="rounded-lg h-9 font-medium text-sm flex-1">
+        {/* <Button type="primary" icon={<PlusOutlined />} onClick={() => dispatch({ type: "NEW_CHAT" })} block className="rounded-lg h-9 font-medium text-sm flex-1">
           New Chat
-        </Button>
+        </Button> */}
+        <Button
+  icon={<PlusOutlined />}
+  onClick={() => dispatch({ type: "NEW_CHAT" })}
+  block
+  className="rounded-lg h-9 font-medium text-sm flex-1"
+  style={{
+    backgroundColor: "#0A3F63",
+    borderColor: "#0A3F63",
+    color: "#fff"
+  }}
+>
+  New Chat
+</Button>
         <Tooltip title={isDark ? "Switch to Light" : "Switch to Dark"}>
           <Button
             type="text"
-            icon={<BulbOutlined style={{ color: isDark ? "#fbbf24" : "#6366f1" }} />}
+            icon={<BulbOutlined style={{ color: isDark ? "#fbbf24" : "#08324F" }} />}
             onClick={toggleTheme}
             className="flex-shrink-0"
           />

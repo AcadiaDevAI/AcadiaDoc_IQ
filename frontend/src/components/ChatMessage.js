@@ -50,13 +50,13 @@ export default function ChatMessage({ msg, index }) {
         style={
           isUser
             ? { backgroundColor: "var(--brand-light)", border: "1px solid var(--brand-accent)" }
-            : { background: "linear-gradient(135deg, #6366f1, #7c3aed)" }
+            : { background: "linear-gradient(135deg, #0A3F63, #0A3F63)" }
         }
       >
         {isUser ? (
           <UserOutlined style={{ color: "var(--brand-accent)", fontSize: 12 }} />
         ) : (
-          <RobotOutlined style={{ color: "#fff", fontSize: 12 }} />
+          <RobotOutlined style={{ color: "#fff", fontSize: 18 }} />
         )}
       </div>
 

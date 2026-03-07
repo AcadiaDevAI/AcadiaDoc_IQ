@@ -13,7 +13,7 @@ import logging
 import math
 import re
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import chromadb
 
@@ -25,9 +25,10 @@ logger = logging.getLogger("acadia-log-iq")
 # ============================================================================
 # CHROMA VECTOR STORE — SINGLETON CLIENT
 # ============================================================================
-# IMPORTANT: We keep a single PersistentClient instance so that reset can
-# safely call client.delete_collection() through the SAME SQLite connection.
-# Creating multiple PersistentClient instances to the same path causes
+# IMPORTANT:
+# We keep a single PersistentClient instance so reset can safely call
+# client.delete_collection() through the SAME SQLite connection.
+# Creating multiple PersistentClient instances to the same path can cause
 # WAL conflicts and "readonly database" errors.
 # ============================================================================
 _chroma_client = None
@@ -46,16 +47,18 @@ def _get_chroma_client():
                 allow_reset=True,
             ),
         )
+        logger.info("Chroma client initialized at: %s", chroma_path)
     return _chroma_client
 
 
 def get_collection() -> Any:
     """Return the persistent Chroma collection (creates if needed)."""
     client = _get_chroma_client()
-    return client.get_or_create_collection(
+    coll = client.get_or_create_collection(
         name=settings.COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
+    return coll
 
 
 def reset_chroma_collection() -> int:
@@ -68,28 +71,29 @@ def reset_chroma_collection() -> int:
     - Won't corrupt the WAL journal
     - Won't cause "readonly database" errors
 
-    Returns: number of chunks that were deleted.
+    Returns:
+        number of chunks that were deleted
     """
     client = _get_chroma_client()
     deleted_count = 0
 
     try:
-        # Get current count before deletion
         existing = client.get_or_create_collection(name=settings.COLLECTION_NAME)
         deleted_count = existing.count()
     except Exception:
         pass
 
     try:
-        # Delete the collection (drops all vectors, metadata, documents)
         client.delete_collection(name=settings.COLLECTION_NAME)
-        logger.info("reset_chroma: Deleted collection '%s' (%d chunks)",
-                     settings.COLLECTION_NAME, deleted_count)
+        logger.info(
+            "reset_chroma: Deleted collection '%s' (%d chunks)",
+            settings.COLLECTION_NAME,
+            deleted_count,
+        )
     except Exception as e:
         logger.warning("reset_chroma: delete_collection failed: %s", e)
 
-    # Recreate empty collection
-    new_coll = client.get_or_create_collection(
+    client.get_or_create_collection(
         name=settings.COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
@@ -105,8 +109,8 @@ class BM25Index:
     """
     Okapi BM25 index for keyword-based retrieval.
 
-    Catches exact term matches (error codes, IPs, device IDs, specific log
-    patterns) that semantic/vector search can miss.
+    Catches exact term matches (error codes, IPs, IDs, technical patterns)
+    that semantic/vector search can miss.
 
     Stored in-memory. Rebuilt from ChromaDB at startup, updated live during
     indexing.
@@ -125,70 +129,95 @@ class BM25Index:
 
     @staticmethod
     def tokenize(text: str) -> List[str]:
-        """Tokenizer that preserves error codes, IPs, paths, technical terms."""
+        """Tokenizer that preserves technical terms, ids, paths, URLs, etc."""
         if not text:
             return []
         text = text.lower()
-        return re.findall(r'[a-z0-9][a-z0-9._:/-]*[a-z0-9]|[a-z0-9]+', text)
+        return re.findall(r"[a-z0-9][a-z0-9._:/-]*[a-z0-9]|[a-z0-9]+", text)
+
+    def _recalculate_stats(self):
+        self.total_docs = len(self.documents)
+        if self.total_docs > 0:
+            self.avg_doc_length = sum(self.doc_lengths.values()) / self.total_docs
+        else:
+            self.avg_doc_length = 0.0
 
     def add_document(self, doc_id: str, text: str, metadata: Optional[Dict] = None):
         tokens = self.tokenize(text)
         if not tokens:
             return
+
         self.documents[doc_id] = text
         self.metadata[doc_id] = metadata or {}
         self.doc_tokens[doc_id] = tokens
         self.doc_lengths[doc_id] = len(tokens)
+
         for token in set(tokens):
             self.inverted_index[token].add(doc_id)
-        self.total_docs = len(self.documents)
-        if self.total_docs > 0:
-            self.avg_doc_length = sum(self.doc_lengths.values()) / self.total_docs
+
+        self._recalculate_stats()
 
     def add_documents_batch(
-        self, doc_ids: List[str], texts: List[str],
+        self,
+        doc_ids: List[str],
+        texts: List[str],
         metadatas: Optional[List[Dict]] = None,
     ):
         if metadatas is None:
             metadatas = [{}] * len(doc_ids)
+
         for doc_id, text, meta in zip(doc_ids, texts, metadatas):
             tokens = self.tokenize(text)
             if not tokens:
                 continue
+
             self.documents[doc_id] = text
-            self.metadata[doc_id] = meta
+            self.metadata[doc_id] = meta or {}
             self.doc_tokens[doc_id] = tokens
             self.doc_lengths[doc_id] = len(tokens)
+
             for token in set(tokens):
                 self.inverted_index[token].add(doc_id)
-        self.total_docs = len(self.documents)
-        if self.total_docs > 0:
-            self.avg_doc_length = sum(self.doc_lengths.values()) / self.total_docs
+
+        self._recalculate_stats()
 
     def _bm25_score(self, query_tokens: List[str], doc_id: str) -> float:
         if doc_id not in self.doc_tokens:
             return 0.0
+
         doc_counts = Counter(self.doc_tokens[doc_id])
         doc_len = self.doc_lengths[doc_id]
         score = 0.0
+
         for qt in query_tokens:
             if qt not in self.inverted_index:
                 continue
+
             df = len(self.inverted_index[qt])
             idf = math.log((self.total_docs - df + 0.5) / (df + 0.5) + 1.0)
+
             tf = doc_counts.get(qt, 0)
             tf_norm = (tf * (self.k1 + 1)) / (
                 tf + self.k1 * (1 - self.b + self.b * doc_len / max(self.avg_doc_length, 1))
             )
             score += idf * tf_norm
+
         return score
 
     def search(
-        self, query: str, n_results: int = 10, file_type: Optional[str] = None,
+        self,
+        query: str,
+        n_results: int = 10,
+        file_type: Optional[str] = None,
     ) -> List[Tuple[str, str, Dict, float]]:
-        """Returns list of (doc_id, text, metadata, score) sorted by relevance."""
+        """
+        Returns list of:
+            (doc_id, text, metadata, score)
+        sorted by relevance descending.
+        """
         if self.total_docs == 0:
             return []
+
         query_tokens = self.tokenize(query)
         if not query_tokens:
             return []
@@ -203,6 +232,7 @@ class BM25Index:
                 d for d in candidates
                 if self.metadata.get(d, {}).get("file_type") == file_type
             }
+
         if not candidates:
             return []
 
@@ -210,7 +240,13 @@ class BM25Index:
         for doc_id in candidates:
             s = self._bm25_score(query_tokens, doc_id)
             if s > 0:
-                scored.append((doc_id, self.documents[doc_id], self.metadata.get(doc_id, {}), s))
+                scored.append((
+                    doc_id,
+                    self.documents[doc_id],
+                    self.metadata.get(doc_id, {}),
+                    s,
+                ))
+
         scored.sort(key=lambda x: x[3], reverse=True)
         return scored[:n_results]
 
@@ -223,39 +259,63 @@ class BM25Index:
         self.avg_doc_length = 0.0
         self.total_docs = 0
 
-    def remove_documents_by_source(self, source_name: str) -> int:
-        """Remove all documents whose metadata 'source' matches source_name."""
+    def _remove_documents_by_predicate(self, predicate: Callable[[str, Dict], bool]) -> int:
+        """
+        Generic remover used by source/file_id/owner cleanup.
+        Predicate receives (doc_id, metadata).
+        """
         to_remove = [
-            doc_id for doc_id, meta in self.metadata.items()
-            if meta.get("source") == source_name
+            doc_id
+            for doc_id, meta in self.metadata.items()
+            if predicate(doc_id, meta or {})
         ]
+
         for doc_id in to_remove:
-            # Remove from inverted index
             tokens = set(self.doc_tokens.get(doc_id, []))
             for token in tokens:
                 if token in self.inverted_index:
                     self.inverted_index[token].discard(doc_id)
                     if not self.inverted_index[token]:
                         del self.inverted_index[token]
-            # Remove from all stores
+
             self.documents.pop(doc_id, None)
             self.metadata.pop(doc_id, None)
             self.doc_tokens.pop(doc_id, None)
             self.doc_lengths.pop(doc_id, None)
-        # Recalculate stats
-        self.total_docs = len(self.documents)
-        if self.total_docs > 0:
-            self.avg_doc_length = sum(self.doc_lengths.values()) / self.total_docs
-        else:
-            self.avg_doc_length = 0.0
+
+        self._recalculate_stats()
         return len(to_remove)
+
+    def remove_documents_by_source(self, source_name: str) -> int:
+        """Remove all documents whose metadata 'source' matches source_name."""
+        removed = self._remove_documents_by_predicate(
+            lambda _doc_id, meta: meta.get("source") == source_name
+        )
+        logger.info("BM25: removed %d docs for source='%s'", removed, source_name)
+        return removed
+
+    def remove_documents_by_file_id(self, file_id: str) -> int:
+        """Remove all documents whose metadata 'file_id' matches file_id."""
+        removed = self._remove_documents_by_predicate(
+            lambda _doc_id, meta: meta.get("file_id") == file_id
+        )
+        logger.info("BM25: removed %d docs for file_id='%s'", removed, file_id)
+        return removed
+
+    def remove_documents_by_owner(self, owner_id: str) -> int:
+        """Remove all documents whose metadata 'owner_id' matches owner_id."""
+        removed = self._remove_documents_by_predicate(
+            lambda _doc_id, meta: meta.get("owner_id", "anonymous") == owner_id
+        )
+        logger.info("BM25: removed %d docs for owner_id='%s'", removed, owner_id)
+        return removed
 
     @property
     def size(self) -> int:
         return self.total_docs
 
 
-# Global instance
+# Global singleton BM25
 bm25_index = BM25Index()
 
 
@@ -264,7 +324,10 @@ def get_bm25_index() -> BM25Index:
 
 
 def rebuild_bm25_from_chroma(collection) -> int:
-    """Rebuild BM25 from all ChromaDB documents. Called at startup."""
+    """
+    Rebuild BM25 from all ChromaDB documents.
+    Called at startup.
+    """
     global bm25_index
     bm25_index.clear()
 
@@ -276,21 +339,30 @@ def rebuild_bm25_from_chroma(collection) -> int:
 
         batch_size = 500
         total = 0
+
         for offset in range(0, count, batch_size):
             limit = min(batch_size, count - offset)
             results = collection.get(
-                limit=limit, offset=offset,
+                limit=limit,
+                offset=offset,
                 include=["documents", "metadatas"],
             )
-            ids = results.get("ids", [])
-            docs = results.get("documents", [])
-            metas = results.get("metadatas", [])
+
+            ids = results.get("ids", []) or []
+            docs = results.get("documents", []) or []
+            metas = results.get("metadatas", []) or []
+
             if ids and docs:
                 bm25_index.add_documents_batch(ids, docs, metas)
                 total += len(ids)
 
-        logger.info("BM25 rebuilt: %d docs, %d terms", bm25_index.size, len(bm25_index.inverted_index))
+        logger.info(
+            "BM25 rebuilt: %d docs, %d terms",
+            bm25_index.size,
+            len(bm25_index.inverted_index),
+        )
         return total
+
     except Exception as e:
         logger.exception("BM25 rebuild failed: %s", e)
         return 0
