@@ -1,8 +1,8 @@
 import axios from "axios";
 
-// const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8000";
-// const API_BASE = process.env.REACT_APP_API_BASE || "http://18.233.93.19:8000";
-const API_BASE = window.location.origin.replace(":8501", ":8000");
+//const API_BASE = process.env.REACT_APP_API_BASE || "http://localhost:8000";
+const API_BASE = process.env.REACT_APP_API_BASE || "http://18.233.93.19:8000";
+//const API_BASE = window.location.origin.replace(":8501", ":8000");
 const API_KEY = process.env.REACT_APP_API_KEY || "";
 
 const api = axios.create({
@@ -14,16 +14,8 @@ const api = axios.create({
 });
 
 // ─── Clerk Token Injection ───────────────────────────────
-// This gets set by useAuthInterceptor() hook in the React app.
-// When Clerk is active, every API call automatically gets
-// Authorization: Bearer <clerk-session-token>
 let _getToken = null;
 
-/**
- * Call this once from a React component that has access to
- * Clerk's useAuth() hook. It registers a token-getter function
- * that the axios interceptor uses.
- */
 export function setTokenGetter(fn) {
   _getToken = fn;
 }
@@ -37,8 +29,7 @@ api.interceptors.request.use(
           config.headers.Authorization = `Bearer ${token}`;
         }
       } catch {
-        // Token fetch failed — request will proceed without auth
-        // and backend will return 401 if Clerk is required
+        // Token fetch failed
       }
     }
     return config;
@@ -92,5 +83,15 @@ export const deleteAllSessions = () => api.delete("/chat/sessions");
 
 // ─── Reset ────────────────────────────────────────────────
 export const resetAll = () => api.post("/reset", {}, { timeout: 30000 });
+
+// ─── Feedback ─────────────────────────────────────────────
+export const sendThumbsUp = (data) =>
+  api.post("/feedback/thumbs-up", data);
+
+export const flushThumbsUp = (count) =>
+  api.post("/feedback/thumbs-up/flush", { count });
+
+export const sendThumbsDown = (data) =>
+  api.post("/feedback/thumbs-down", data);
 
 export default api;

@@ -52,6 +52,13 @@ class Settings(BaseSettings):
     # Set to "true" to enforce Clerk JWT auth on all endpoints
     CLERK_ENABLED: str = "false"
 
+    # ── AWS SES (Feedback Emails) ─────────────────────────────
+    # Sender must be verified in SES (email or domain)
+    SES_SENDER_EMAIL: str = "noreply@acadiaconsultants.com"
+    SES_FEEDBACK_RECIPIENT: str = "dev@acadiaconsultants.com"
+    SES_REGION: Optional[str] = None  # Defaults to AWS_REGION if not set
+    SES_ENABLED: str = "true"
+
     model_config = SettingsConfigDict(
         env_file=str(BASE_DIR / ".env"),
         env_file_encoding="utf-8",

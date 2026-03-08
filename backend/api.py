@@ -131,6 +131,64 @@ bedrock = _make_bedrock_client()
 
 
 # ============================================================================
+# SES CLIENT (for feedback emails)
+# ============================================================================
+def _make_ses_client():
+    """Create SES client using same AWS creds as Bedrock."""
+    ses_region = settings.SES_REGION or settings.AWS_REGION
+    kwargs = {
+        "service_name": "ses",
+        "region_name": ses_region,
+    }
+    if settings.AWS_ACCESS_KEY_ID and settings.AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = settings.AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = settings.AWS_SECRET_ACCESS_KEY
+        if settings.AWS_SESSION_TOKEN:
+            kwargs["aws_session_token"] = settings.AWS_SESSION_TOKEN
+    return boto3.client(**kwargs)
+
+
+ses_client = None
+try:
+    if settings.SES_ENABLED.lower() == "true":
+        ses_client = _make_ses_client()
+        logger.info("SES client ready (region=%s, sender=%s, recipient=%s)",
+                     settings.SES_REGION or settings.AWS_REGION,
+                     settings.SES_SENDER_EMAIL,
+                     settings.SES_FEEDBACK_RECIPIENT)
+except Exception as e:
+    logger.warning("SES client init failed (feedback emails disabled): %s", e)
+
+
+def send_feedback_email(subject: str, body_text: str, body_html: str) -> bool:
+    """Send feedback email via AWS SES. Returns True on success."""
+    if not ses_client:
+        logger.warning("SES not configured — feedback email skipped")
+        return False
+    try:
+        ses_client.send_email(
+            Source=settings.SES_SENDER_EMAIL,
+            Destination={"ToAddresses": [settings.SES_FEEDBACK_RECIPIENT]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {"Data": body_text, "Charset": "UTF-8"},
+                    "Html": {"Data": body_html, "Charset": "UTF-8"},
+                },
+            },
+        )
+        logger.info("Feedback email sent: %s", subject)
+        return True
+    except Exception as e:
+        logger.exception("SES send_email failed: %s", e)
+        return False
+
+
+# In-memory feedback accumulator (thumbs-up counts sent on batch/signout)
+FEEDBACK_THUMBS_UP: Dict[str, int] = {}  # { user_id: count }
+
+
+# ============================================================================
 # HELPERS
 # ============================================================================
 def _normalize_owner_id(user_id: Optional[str]) -> str:
@@ -1608,6 +1666,136 @@ ANSWER:"""
             "headroom": max_tok - ptok,
         },
     )
+
+
+# ============================================================================
+# ROUTES — FEEDBACK
+# ============================================================================
+class ThumbsUpRequest(BaseModel):
+    message_index: Optional[int] = None
+    session_id: Optional[str] = None
+    model_config = ConfigDict(extra="ignore")
+
+
+class ThumbsDownRequest(BaseModel):
+    message_index: Optional[int] = None
+    session_id: Optional[str] = None
+    question: Optional[str] = None
+    answer: Optional[str] = None
+    feedback_text: str = Field(min_length=1, max_length=2000)
+    model_config = ConfigDict(extra="ignore")
+
+
+class ThumbsUpFlushRequest(BaseModel):
+    count: int = Field(ge=0)
+    model_config = ConfigDict(extra="ignore")
+
+
+@app.post("/feedback/thumbs-up")
+async def feedback_thumbs_up(
+    req: ThumbsUpRequest,
+    user_id: Optional[str] = Depends(auth_dependency),
+):
+    """
+    Record a thumbs-up. Accumulated in memory per user.
+    Frontend sends flush request on sign-out / tab close.
+    """
+    owner = _normalize_owner_id(user_id)
+    FEEDBACK_THUMBS_UP[owner] = FEEDBACK_THUMBS_UP.get(owner, 0) + 1
+    logger.info("Thumbs-up from %s (total: %d)", owner, FEEDBACK_THUMBS_UP[owner])
+    return {"status": "recorded", "total": FEEDBACK_THUMBS_UP[owner]}
+
+
+@app.post("/feedback/thumbs-up/flush")
+async def feedback_thumbs_up_flush(
+    req: ThumbsUpFlushRequest,
+    background_tasks: BackgroundTasks,
+    user_id: Optional[str] = Depends(auth_dependency),
+):
+    """
+    Flush accumulated thumbs-up count via email.
+    Called by frontend on sign-out or tab close.
+    """
+    owner = _normalize_owner_id(user_id)
+    count = req.count or FEEDBACK_THUMBS_UP.get(owner, 0)
+
+    if count <= 0:
+        return {"status": "nothing_to_send", "count": 0}
+
+    # Clear accumulator
+    FEEDBACK_THUMBS_UP.pop(owner, None)
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    subject = f"Acadia Doc IQ — {count} Thumbs Up from {owner}"
+    body_text = (
+        f"User: {owner}\n"
+        f"Thumbs Up Count: {count}\n"
+        f"Timestamp: {now}\n"
+    )
+    body_html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background: #4f46e5; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0;">👍 Positive Feedback Summary</h2>
+        </div>
+        <div style="background: #f8f9fb; padding: 20px; border: 1px solid #dee2e6; border-radius: 0 0 8px 8px;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr><td style="padding: 8px 0; font-weight: bold;">User</td><td>{owner}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold;">Thumbs Up Count</td><td style="color: #10b981; font-size: 24px; font-weight: bold;">{count}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold;">Sent At</td><td>{now}</td></tr>
+            </table>
+        </div>
+    </div>
+    """
+
+    background_tasks.add_task(send_feedback_email, subject, body_text, body_html)
+    return {"status": "flushed", "count": count}
+
+
+@app.post("/feedback/thumbs-down")
+async def feedback_thumbs_down(
+    req: ThumbsDownRequest,
+    background_tasks: BackgroundTasks,
+    user_id: Optional[str] = Depends(auth_dependency),
+):
+    """
+    Thumbs-down with improvement feedback. Sends email immediately.
+    """
+    owner = _normalize_owner_id(user_id)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    subject = f"Acadia Doc IQ — Improvement Feedback from {owner}"
+    body_text = (
+        f"User: {owner}\n"
+        f"Timestamp: {now}\n"
+        f"Session: {req.session_id or 'N/A'}\n"
+        f"Question: {req.question or 'N/A'}\n"
+        f"Answer Preview: {(req.answer or 'N/A')[:300]}\n"
+        f"\nFeedback:\n{req.feedback_text}\n"
+    )
+    body_html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <div style="background: #dc2626; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0;">👎 Improvement Feedback</h2>
+        </div>
+        <div style="background: #f8f9fb; padding: 20px; border: 1px solid #dee2e6; border-radius: 0 0 8px 8px;">
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">User</td><td>{owner}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Sent At</td><td>{now}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Session</td><td>{req.session_id or 'N/A'}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Question</td><td>{req.question or 'N/A'}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Answer</td><td style="font-size: 12px; color: #666;">{(req.answer or 'N/A')[:500]}</td></tr>
+            </table>
+            <div style="margin-top: 16px; padding: 16px; background: white; border: 1px solid #dee2e6; border-radius: 8px;">
+                <p style="font-weight: bold; margin: 0 0 8px 0; color: #dc2626;">User's Feedback:</p>
+                <p style="margin: 0; white-space: pre-wrap;">{req.feedback_text}</p>
+            </div>
+        </div>
+    </div>
+    """
+
+    background_tasks.add_task(send_feedback_email, subject, body_text, body_html)
+    logger.info("Thumbs-down feedback from %s: %s", owner, req.feedback_text[:100])
+    return {"status": "sent", "message": "Thank you for your feedback!"}
 
 
 # ============================================================================
