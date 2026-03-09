@@ -1817,20 +1817,44 @@ async def submit_feedback(
 # ============================================================================
 # ERROR HANDLERS
 # ============================================================================
+# @app.exception_handler(HTTPException)
+# async def http_err(request, exc):
+#     return JSONResponse(exc.status_code, {
+#         "error": exc.detail,
+#         "path": request.url.path,
+#         "timestamp": datetime.now(timezone.utc).isoformat(),
+#     })
+
+
+# @app.exception_handler(Exception)
+# async def general_err(request, exc):
+#     logger.exception("Unhandled: %s", exc)
+#     return JSONResponse(500, {
+#         "error": "Internal server error",
+#         "path": request.url.path,
+#         "timestamp": datetime.now(timezone.utc).isoformat(),
+#     })
+
 @app.exception_handler(HTTPException)
 async def http_err(request, exc):
-    return JSONResponse(exc.status_code, {
-        "error": exc.detail,
-        "path": request.url.path,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail,
+            "path": request.url.path,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
 
 @app.exception_handler(Exception)
 async def general_err(request, exc):
     logger.exception("Unhandled: %s", exc)
-    return JSONResponse(500, {
-        "error": "Internal server error",
-        "path": request.url.path,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "Internal server error",
+            "path": request.url.path,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
