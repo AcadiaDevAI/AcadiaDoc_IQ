@@ -1,10 +1,5 @@
 import React, { useRef, useEffect, useCallback } from "react";
 import { message } from "antd";
-import {
-  CloudUploadOutlined,
-  SearchOutlined,
-  ThunderboltOutlined,
-} from "@ant-design/icons";
 import { useChat } from "../hooks/ChatContext";
 import useAuthInterceptor from "../hooks/useAuthInterceptor";
 import { askQuestion, listSessions } from "../services/api";
@@ -33,16 +28,7 @@ function EmptyState() {
   return (
     <div className="flex-1 flex items-center justify-center px-4">
       <div className="text-center max-w-md">
-        {/* <div className="w-21 h-20 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg overflow-hidden">
-          <img
-            src="/logo.png"
-            alt="Acadia Logo"
-            className="w-full h-full object-contain"
-          />
-        </div> */}
-
         <h2 className="text-xl font-bold t-text mb-2">Acadia Log IQ</h2>
-
         <p className="t-text-muted text-sm mb-8">
           LogIQ - AI-Assisted Operational Intelligence.
         </p>
@@ -57,6 +43,7 @@ export default function ChatArea() {
 
   useAuthInterceptor();
 
+  // Auto-scroll on new messages
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTo({
@@ -86,31 +73,19 @@ export default function ChatArea() {
           },
         });
 
+        // Refresh chat history sidebar
         try {
           const sessRes = await listSessions();
-          dispatch({
-            type: "SET_SESSIONS",
-            payload: sessRes.data.sessions || [],
-          });
+          dispatch({ type: "SET_SESSIONS", payload: sessRes.data.sessions || [] });
         } catch {}
 
       } catch (err) {
-        const detail =
-          err?.response?.data?.error ||
-          err?.message ||
-          "Something went wrong";
-
+        const detail = err?.response?.data?.error || err?.message || "Something went wrong";
         message.error(detail);
-
         dispatch({
           type: "ADD_ASSISTANT_MESSAGE",
-          payload: {
-            answer: `Error: ${detail}. Please try again.`,
-            sources: [],
-            confidence: 0,
-          },
+          payload: { answer: `Error: ${detail}. Please try again.`, sources: [], confidence: 0 },
         });
-
       } finally {
         dispatch({ type: "SET_LOADING", payload: false });
       }
@@ -120,34 +95,24 @@ export default function ChatArea() {
 
   return (
     <div className="flex flex-col h-screen flex-1 t-bg-primary relative">
-
-      {/* WATERMARK LOGO */}
-      <div
-        className="absolute inset-0 flex items-center justify-center pointer-events-none"
-        style={{
-          zIndex: 0,
-          opacity: 0.05,
-        }}
-      >
-        <img
-          src="/logo.png"
-          alt="Acadia Watermark"
-          className="w-[350px] md:w-[420px] lg:w-[500px] object-contain select-none"
-        />
+      {/* Watermark */}
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none" style={{ zIndex: 0, opacity: 0.05 }}>
+        <img src="/logo.png" alt="Acadia Watermark" className="w-[350px] md:w-[420px] lg:w-[500px] object-contain select-none" />
       </div>
 
-      {/* CHAT AREA */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto relative"
-        style={{ zIndex: 10 }}
-      >
+      {/* Messages */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto relative" style={{ zIndex: 10 }}>
         {state.messages.length === 0 ? (
           <EmptyState />
         ) : (
           <div className="pb-4">
             {state.messages.map((msg, i) => (
-              <ChatMessage key={i} msg={msg} index={i} />
+              <ChatMessage
+                key={i}
+                msg={msg}
+                index={i}
+                sessionId={state.sessionId}
+              />
             ))}
             {state.isLoading && <TypingIndicator />}
           </div>

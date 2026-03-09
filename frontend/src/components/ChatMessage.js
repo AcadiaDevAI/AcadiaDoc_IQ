@@ -15,14 +15,30 @@ import {
   DislikeOutlined,
   DislikeFilled,
 } from "@ant-design/icons";
-import { sendThumbsUp, sendThumbsDown } from "../services/api";
+import { useChat } from "../hooks/ChatContext";
+import { saveFeedbackState, submitFeedback } from "../services/api";
 
 const { TextArea } = Input;
 
+/**
+ * ChatMessage
+ *
+ * Feedback flow:
+ *   👍 Like → icon turns green + "Give positive feedback" dialog opens
+ *   👎 Dislike → icon turns red + "Give negative feedback" dialog opens
+ *   Both dialogs: user types optional message (up to 1200 chars) → sent via SES email
+ *   Like/dislike state is persisted in backend session → survives refresh/sign-out
+ */
 export default function ChatMessage({ msg, index, sessionId }) {
+  const { dispatch } = useChat();
   const [copied, setCopied] = useState(false);
-  const [feedbackState, setFeedbackState] = useState(null); // null | "up" | "down"
-  const [showFeedbackModal, setShowFeedbackModal] = useState(false);
+
+  // Feedback state: read from msg.feedback (persisted from backend) or local override
+  const feedbackState = msg.feedback || null; // "like" | "dislike" | null
+
+  // Modal state
+  const [showModal, setShowModal] = useState(false);
+  const [modalType, setModalType] = useState(null); // "like" | "dislike"
   const [feedbackText, setFeedbackText] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -34,41 +50,54 @@ export default function ChatMessage({ msg, index, sessionId }) {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const handleThumbsUp = async () => {
-    if (feedbackState === "up") return; // already clicked
-    setFeedbackState("up");
-    try {
-      await sendThumbsUp({
-        message_index: index,
-        session_id: sessionId || null,
-      });
-    } catch {
-      // Silent fail — don't disrupt UX
+  // ── Handle Like click ──────────────────────────────────
+  const handleLike = () => {
+    if (feedbackState === "like") return; // already liked
+
+    // Update local state immediately
+    dispatch({ type: "SET_MESSAGE_FEEDBACK", payload: { index, feedback: "like" } });
+
+    // Persist to backend (so it survives refresh/sign-out)
+    if (sessionId) {
+      saveFeedbackState(sessionId, index, "like").catch(() => {});
     }
+
+    // Open positive feedback dialog
+    setModalType("like");
+    setFeedbackText("");
+    setShowModal(true);
   };
 
-  const handleThumbsDown = () => {
-    if (feedbackState === "down") return;
-    setFeedbackState("down");
-    setShowFeedbackModal(true);
+  // ── Handle Dislike click ───────────────────────────────
+  const handleDislike = () => {
+    if (feedbackState === "dislike") return; // already disliked
+
+    dispatch({ type: "SET_MESSAGE_FEEDBACK", payload: { index, feedback: "dislike" } });
+
+    if (sessionId) {
+      saveFeedbackState(sessionId, index, "dislike").catch(() => {});
+    }
+
+    // Open negative feedback dialog
+    setModalType("dislike");
+    setFeedbackText("");
+    setShowModal(true);
   };
 
+  // ── Submit feedback message ────────────────────────────
   const handleSubmitFeedback = async () => {
-    if (!feedbackText.trim()) {
-      message.warning("Please enter your feedback");
-      return;
-    }
     setSubmitting(true);
     try {
-      await sendThumbsDown({
-        message_index: index,
+      await submitFeedback({
         session_id: sessionId || null,
+        message_index: index,
+        feedback_type: modalType,
+        feedback_text: feedbackText.trim(),
         question: msg._question || null,
         answer: msg.content?.substring(0, 500) || null,
-        feedback_text: feedbackText.trim(),
       });
       message.success("Thank you for your feedback!");
-      setShowFeedbackModal(false);
+      setShowModal(false);
       setFeedbackText("");
     } catch {
       message.error("Failed to send feedback. Please try again.");
@@ -77,13 +106,11 @@ export default function ChatMessage({ msg, index, sessionId }) {
     }
   };
 
-  const handleCancelFeedback = () => {
-    setShowFeedbackModal(false);
+  // ── Close modal (skip feedback text, icon state already saved) ──
+  const handleCancelModal = () => {
+    setShowModal(false);
     setFeedbackText("");
-    // Reset to neutral if they cancel without submitting
-    if (!feedbackText.trim()) {
-      setFeedbackState(null);
-    }
+    // Icon state is already persisted — closing just skips the text
   };
 
   const confidenceColor = (c) => {
@@ -92,7 +119,6 @@ export default function ChatMessage({ msg, index, sessionId }) {
     if (c >= 0.4) return "#f59e0b";
     return "#ef4444";
   };
-
   const confidenceLabel = (c) => {
     if (c >= 0.8) return "High";
     if (c >= 0.6) return "Good";
@@ -101,6 +127,9 @@ export default function ChatMessage({ msg, index, sessionId }) {
   };
 
   const allSources = Array.isArray(msg.sources) ? msg.sources.filter(Boolean) : [];
+
+  // Modal title and placeholder change based on like vs dislike
+  const isLikeModal = modalType === "like";
 
   return (
     <div
@@ -152,108 +181,97 @@ export default function ChatMessage({ msg, index, sessionId }) {
           )}
         </div>
 
-        {/* Message body */}
         <div className="markdown-body">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
         </div>
 
-        {/* Sources */}
         {!isUser && allSources.length > 0 && (
           <Collapse
-            ghost
-            size="small"
-            className="mt-3"
-            items={[
-              {
-                key: "sources",
-                label: (
-                  <span className="text-xs font-medium" style={{ color: "var(--brand-accent)" }}>
-                    <FileTextOutlined className="mr-1" />
-                    Sources ({allSources.length})
-                  </span>
-                ),
-                children: (
-                  <div className="flex flex-wrap gap-1.5">
-                    {allSources.map((s, i) => (
-                      <Tag key={i} color="blue" className="text-[10px] rounded-md">{s}</Tag>
-                    ))}
-                  </div>
-                ),
-              },
-            ]}
+            ghost size="small" className="mt-3"
+            items={[{
+              key: "sources",
+              label: (
+                <span className="text-xs font-medium" style={{ color: "var(--brand-accent)" }}>
+                  <FileTextOutlined className="mr-1" />Sources ({allSources.length})
+                </span>
+              ),
+              children: (
+                <div className="flex flex-wrap gap-1.5">
+                  {allSources.map((s, i) => (
+                    <Tag key={i} color="blue" className="text-[10px] rounded-md">{s}</Tag>
+                  ))}
+                </div>
+              ),
+            }]}
           />
         )}
 
-        {/* Action buttons: Copy + Thumbs Up + Thumbs Down */}
+        {/* Action buttons: Copy | 👍 Like | 👎 Dislike */}
         {!isUser && (
           <div className="mt-2 flex items-center gap-3">
-            {/* Copy */}
             <Tooltip title={copied ? "Copied!" : "Copy"}>
-              <button
-                onClick={handleCopy}
-                className="t-text-faint transition-colors text-xs"
-                style={{ cursor: "pointer", background: "none", border: "none", padding: 0 }}
-              >
+              <button onClick={handleCopy} style={{ cursor: "pointer", background: "none", border: "none", padding: 0, color: "var(--text-faint)" }} className="text-xs">
                 {copied ? <CheckOutlined style={{ color: "#10b981" }} /> : <CopyOutlined />}
               </button>
             </Tooltip>
 
-            {/* Thumbs Up */}
-            <Tooltip title="Helpful">
+            {/* Like — green when active, opens positive feedback dialog */}
+            <Tooltip title={feedbackState === "like" ? "You liked this" : "Like"}>
               <button
-                onClick={handleThumbsUp}
-                className="transition-colors text-sm"
+                onClick={handleLike}
                 style={{
-                  cursor: feedbackState === "up" ? "default" : "pointer",
-                  background: "none",
-                  border: "none",
-                  padding: 0,
-                  color: feedbackState === "up" ? "#10b981" : "var(--text-faint)",
+                  cursor: feedbackState === "like" ? "default" : "pointer",
+                  background: "none", border: "none", padding: 0,
+                  color: feedbackState === "like" ? "#10b981" : "var(--text-faint)",
                 }}
+                className="text-sm"
               >
-                {feedbackState === "up" ? <LikeFilled /> : <LikeOutlined />}
+                {feedbackState === "like" ? <LikeFilled /> : <LikeOutlined />}
               </button>
             </Tooltip>
 
-            {/* Thumbs Down */}
-            <Tooltip title="Needs improvement">
+            {/* Dislike — red when active, opens negative feedback dialog */}
+            <Tooltip title={feedbackState === "dislike" ? "You disliked this" : "Dislike"}>
               <button
-                onClick={handleThumbsDown}
-                className="transition-colors text-sm"
+                onClick={handleDislike}
                 style={{
-                  cursor: feedbackState === "down" ? "default" : "pointer",
-                  background: "none",
-                  border: "none",
-                  padding: 0,
-                  color: feedbackState === "down" ? "#ef4444" : "var(--text-faint)",
+                  cursor: feedbackState === "dislike" ? "default" : "pointer",
+                  background: "none", border: "none", padding: 0,
+                  color: feedbackState === "dislike" ? "#ef4444" : "var(--text-faint)",
                 }}
+                className="text-sm"
               >
-                {feedbackState === "down" ? <DislikeFilled /> : <DislikeOutlined />}
+                {feedbackState === "dislike" ? <DislikeFilled /> : <DislikeOutlined />}
               </button>
             </Tooltip>
           </div>
         )}
       </div>
 
-      {/* Thumbs Down Feedback Modal */}
+      {/* Feedback Dialog — shown for both like and dislike */}
       <Modal
-        title="How can we improve?"
-        open={showFeedbackModal}
+        title={isLikeModal ? "👍 Give positive feedback" : "👎 Give negative feedback"}
+        open={showModal}
         onOk={handleSubmitFeedback}
-        onCancel={handleCancelFeedback}
-        okText="Submit Feedback"
-        cancelText="Cancel"
+        onCancel={handleCancelModal}
+        okText="Submit"
+        cancelText="Skip"
         confirmLoading={submitting}
-        okButtonProps={{ disabled: !feedbackText.trim() }}
       >
         <p className="t-text-muted text-sm mb-3">
-          Your feedback helps us improve. Please describe what was wrong or what you expected.
+          {isLikeModal
+            ? "What did you like about this response? (optional)"
+            : "What could be improved about this response? (optional)"}
         </p>
         <TextArea
           rows={4}
           maxLength={2000}
           showCount
-          placeholder="e.g., The answer was incorrect because... / I expected it to..."
+          placeholder={
+            isLikeModal
+              ? "e.g., The answer was accurate and well-structured..."
+              : "e.g., The answer missed important details about..."
+          }
           value={feedbackText}
           onChange={(e) => setFeedbackText(e.target.value)}
           autoFocus

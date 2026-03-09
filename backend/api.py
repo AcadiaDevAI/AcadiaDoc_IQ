@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from config import settings
 from vector_store import get_collection, get_bm25_index, rebuild_bm25_from_chroma, reset_chroma_collection
-from clerk_auth import clerk_auth_dependency, is_clerk_enabled
+from clerk_auth import clerk_auth_dependency, is_clerk_enabled, get_clerk_user_display
 
 
 if sys.version_info < (3, 11):
@@ -134,7 +134,7 @@ bedrock = _make_bedrock_client()
 # SES CLIENT (for feedback emails)
 # ============================================================================
 def _make_ses_client():
-    """Create SES client using same AWS creds as Bedrock."""
+    """Create SES client reusing same AWS credentials as Bedrock."""
     ses_region = settings.SES_REGION or settings.AWS_REGION
     kwargs = {
         "service_name": "ses",
@@ -148,16 +148,15 @@ def _make_ses_client():
     return boto3.client(**kwargs)
 
 
+# Initialize SES client (None if disabled or init fails)
 ses_client = None
 try:
     if settings.SES_ENABLED.lower() == "true":
         ses_client = _make_ses_client()
-        logger.info("SES client ready (region=%s, sender=%s, recipient=%s)",
-                     settings.SES_REGION or settings.AWS_REGION,
-                     settings.SES_SENDER_EMAIL,
-                     settings.SES_FEEDBACK_RECIPIENT)
+        logger.info("SES ready (sender=%s, recipient=%s)",
+                     settings.SES_SENDER_EMAIL, settings.SES_FEEDBACK_RECIPIENT)
 except Exception as e:
-    logger.warning("SES client init failed (feedback emails disabled): %s", e)
+    logger.warning("SES init failed (feedback emails disabled): %s", e)
 
 
 def send_feedback_email(subject: str, body_text: str, body_html: str) -> bool:
@@ -184,8 +183,9 @@ def send_feedback_email(subject: str, body_text: str, body_html: str) -> bool:
         return False
 
 
-# In-memory feedback accumulator (thumbs-up counts sent on batch/signout)
-FEEDBACK_THUMBS_UP: Dict[str, int] = {}  # { user_id: count }
+def _resolve_user_display(user_id: Optional[str]) -> dict:
+    """Resolve user_id to {email, name, user_id} using Clerk Backend API."""
+    return get_clerk_user_display(user_id)
 
 
 # ============================================================================
@@ -1671,130 +1671,146 @@ ANSWER:"""
 # ============================================================================
 # ROUTES — FEEDBACK
 # ============================================================================
-class ThumbsUpRequest(BaseModel):
-    message_index: Optional[int] = None
+
+class FeedbackSubmitRequest(BaseModel):
+    """Request body for submitting feedback (like or dislike)."""
     session_id: Optional[str] = None
+    message_index: Optional[int] = None       # index of the AI message in the session
+    feedback_type: str = Field(pattern="^(like|dislike)$")  # "like" or "dislike"
+    feedback_text: str = Field(default="", max_length=1200)  # optional message (up to 1200 chars)
+    question: Optional[str] = None             # the user's question (for email context)
+    answer: Optional[str] = None               # the AI's answer preview (for email context)
     model_config = ConfigDict(extra="ignore")
 
 
-class ThumbsDownRequest(BaseModel):
-    message_index: Optional[int] = None
-    session_id: Optional[str] = None
-    question: Optional[str] = None
-    answer: Optional[str] = None
-    feedback_text: str = Field(min_length=1, max_length=2000)
+class FeedbackStateRequest(BaseModel):
+    """Request body for persisting like/dislike state on a message."""
+    session_id: str
+    message_index: int
+    feedback_type: str = Field(pattern="^(like|dislike|none)$")  # "like", "dislike", or "none" to clear
     model_config = ConfigDict(extra="ignore")
 
 
-class ThumbsUpFlushRequest(BaseModel):
-    count: int = Field(ge=0)
-    model_config = ConfigDict(extra="ignore")
-
-
-@app.post("/feedback/thumbs-up")
-async def feedback_thumbs_up(
-    req: ThumbsUpRequest,
+@app.post("/feedback/state")
+async def save_feedback_state(
+    req: FeedbackStateRequest,
     user_id: Optional[str] = Depends(auth_dependency),
 ):
     """
-    Record a thumbs-up. Accumulated in memory per user.
-    Frontend sends flush request on sign-out / tab close.
+    Persist like/dislike state on a specific message in a session.
+    This state survives sign-out and page refresh because it's stored
+    in the backend session data.
+
+    The frontend reads it back when loading a session via GET /chat/sessions/{id}.
     """
     owner = _normalize_owner_id(user_id)
-    FEEDBACK_THUMBS_UP[owner] = FEEDBACK_THUMBS_UP.get(owner, 0) + 1
-    logger.info("Thumbs-up from %s (total: %d)", owner, FEEDBACK_THUMBS_UP[owner])
-    return {"status": "recorded", "total": FEEDBACK_THUMBS_UP[owner]}
+    session = CHAT_SESSIONS.get(req.session_id)
+
+    if not session or session.get("owner_id", "anonymous") != owner:
+        raise HTTPException(404, "Session not found")
+
+    messages = session.get("messages", [])
+    if req.message_index < 0 or req.message_index >= len(messages):
+        raise HTTPException(400, "Invalid message index")
+
+    # Store feedback_type on the message object itself
+    # "none" clears the feedback (user un-clicked)
+    if req.feedback_type == "none":
+        messages[req.message_index].pop("feedback", None)
+    else:
+        messages[req.message_index]["feedback"] = req.feedback_type
+
+    session["updated_at"] = datetime.now(timezone.utc).isoformat()
+    return {"status": "saved", "feedback_type": req.feedback_type}
 
 
-@app.post("/feedback/thumbs-up/flush")
-async def feedback_thumbs_up_flush(
-    req: ThumbsUpFlushRequest,
+@app.post("/feedback/submit")
+async def submit_feedback(
+    req: FeedbackSubmitRequest,
     background_tasks: BackgroundTasks,
     user_id: Optional[str] = Depends(auth_dependency),
 ):
     """
-    Flush accumulated thumbs-up count via email.
-    Called by frontend on sign-out or tab close.
+    Submit feedback (like or dislike) with an optional message.
+    Sends an email via SES with the user's real name, email, feedback type, and message.
     """
     owner = _normalize_owner_id(user_id)
-    count = req.count or FEEDBACK_THUMBS_UP.get(owner, 0)
 
-    if count <= 0:
-        return {"status": "nothing_to_send", "count": 0}
+    # Resolve actual user name/email from Clerk
+    user_info = _resolve_user_display(user_id)
+    display_name = user_info["name"]
+    display_email = user_info["email"]
 
-    # Clear accumulator
-    FEEDBACK_THUMBS_UP.pop(owner, None)
+    is_like = req.feedback_type == "like"
+    emoji = "👍" if is_like else "👎"
+    label = "Positive" if is_like else "Negative"
+    color = "#10b981" if is_like else "#dc2626"
+    header_bg = "#4f46e5" if is_like else "#dc2626"
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject = f"Acadia Doc IQ — {count} Thumbs Up from {owner}"
+
+    subject = f"Acadia Doc IQ — {emoji} {label} Feedback from {display_name}"
+
+    # Plain text version
     body_text = (
-        f"User: {owner}\n"
-        f"Thumbs Up Count: {count}\n"
-        f"Timestamp: {now}\n"
-    )
-    body_html = f"""
-    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <div style="background: #4f46e5; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0;">👍 Positive Feedback Summary</h2>
-        </div>
-        <div style="background: #f8f9fb; padding: 20px; border: 1px solid #dee2e6; border-radius: 0 0 8px 8px;">
-            <table style="width: 100%; border-collapse: collapse;">
-                <tr><td style="padding: 8px 0; font-weight: bold;">User</td><td>{owner}</td></tr>
-                <tr><td style="padding: 8px 0; font-weight: bold;">Thumbs Up Count</td><td style="color: #10b981; font-size: 24px; font-weight: bold;">{count}</td></tr>
-                <tr><td style="padding: 8px 0; font-weight: bold;">Sent At</td><td>{now}</td></tr>
-            </table>
-        </div>
-    </div>
-    """
-
-    background_tasks.add_task(send_feedback_email, subject, body_text, body_html)
-    return {"status": "flushed", "count": count}
-
-
-@app.post("/feedback/thumbs-down")
-async def feedback_thumbs_down(
-    req: ThumbsDownRequest,
-    background_tasks: BackgroundTasks,
-    user_id: Optional[str] = Depends(auth_dependency),
-):
-    """
-    Thumbs-down with improvement feedback. Sends email immediately.
-    """
-    owner = _normalize_owner_id(user_id)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    subject = f"Acadia Doc IQ — Improvement Feedback from {owner}"
-    body_text = (
-        f"User: {owner}\n"
+        f"Feedback Type: {label} ({emoji})\n"
+        f"User: {display_name}\n"
+        f"Email: {display_email}\n"
+        f"User ID: {owner}\n"
         f"Timestamp: {now}\n"
         f"Session: {req.session_id or 'N/A'}\n"
-        f"Question: {req.question or 'N/A'}\n"
-        f"Answer Preview: {(req.answer or 'N/A')[:300]}\n"
-        f"\nFeedback:\n{req.feedback_text}\n"
     )
+    if req.question:
+        body_text += f"Question: {req.question}\n"
+    if req.answer:
+        body_text += f"Answer Preview: {req.answer[:300]}\n"
+    if req.feedback_text.strip():
+        body_text += f"\nFeedback Message:\n{req.feedback_text}\n"
+    else:
+        body_text += "\nFeedback Message: (none provided)\n"
+
+    # HTML version — nice formatted email
+    feedback_html = ""
+    if req.feedback_text.strip():
+        feedback_html = f"""
+            <div style="margin-top: 16px; padding: 16px; background: white; border: 1px solid #dee2e6; border-radius: 8px;">
+                <p style="font-weight: bold; margin: 0 0 8px 0; color: {color};">Feedback Message:</p>
+                <p style="margin: 0; white-space: pre-wrap;">{req.feedback_text}</p>
+            </div>
+        """
+
+    question_row = ""
+    if req.question:
+        question_row = f'<tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Question</td><td>{req.question}</td></tr>'
+
+    answer_row = ""
+    if req.answer:
+        answer_row = f'<tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Answer</td><td style="font-size: 12px; color: #666;">{req.answer[:500]}</td></tr>'
+
     body_html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-        <div style="background: #dc2626; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
-            <h2 style="margin: 0;">👎 Improvement Feedback</h2>
+        <div style="background: {header_bg}; color: white; padding: 20px; border-radius: 8px 8px 0 0;">
+            <h2 style="margin: 0;">{emoji} {label} Feedback</h2>
         </div>
         <div style="background: #f8f9fb; padding: 20px; border: 1px solid #dee2e6; border-radius: 0 0 8px 8px;">
             <table style="width: 100%; border-collapse: collapse;">
-                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">User</td><td>{owner}</td></tr>
-                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Sent At</td><td>{now}</td></tr>
-                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Session</td><td>{req.session_id or 'N/A'}</td></tr>
-                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Question</td><td>{req.question or 'N/A'}</td></tr>
-                <tr><td style="padding: 8px 0; font-weight: bold; vertical-align: top;">Answer</td><td style="font-size: 12px; color: #666;">{(req.answer or 'N/A')[:500]}</td></tr>
+                <tr>
+                    <td style="padding: 8px 0; font-weight: bold;">Feedback Type</td>
+                    <td style="color: {color}; font-weight: bold; font-size: 16px;">{emoji} {label}</td>
+                </tr>
+                <tr><td style="padding: 8px 0; font-weight: bold;">Name</td><td>{display_name}</td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold;">Email</td><td><a href="mailto:{display_email}">{display_email}</a></td></tr>
+                <tr><td style="padding: 8px 0; font-weight: bold;">Sent At</td><td>{now}</td></tr>
+                {question_row}
+                {answer_row}
             </table>
-            <div style="margin-top: 16px; padding: 16px; background: white; border: 1px solid #dee2e6; border-radius: 8px;">
-                <p style="font-weight: bold; margin: 0 0 8px 0; color: #dc2626;">User's Feedback:</p>
-                <p style="margin: 0; white-space: pre-wrap;">{req.feedback_text}</p>
-            </div>
+            {feedback_html}
         </div>
     </div>
     """
 
     background_tasks.add_task(send_feedback_email, subject, body_text, body_html)
-    logger.info("Thumbs-down feedback from %s: %s", owner, req.feedback_text[:100])
+    logger.info("Feedback [%s] from %s (%s): %s", req.feedback_type, display_name, display_email, req.feedback_text[:100] or "(no message)")
     return {"status": "sent", "message": "Thank you for your feedback!"}
 
 

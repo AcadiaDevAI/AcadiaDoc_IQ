@@ -1,42 +1,43 @@
-import React, { createContext, useContext, useReducer, useCallback } from "react";
+import React, { createContext, useContext, useReducer } from "react";
 
 const ChatContext = createContext();
 
 const initialState = {
-  // Current session
   sessionId: null,
   messages: [],
-
-  // Sidebar data
   sessions: [],
   uploadedFiles: [],
-
-  // UI states
   isLoading: false,
   isUploading: false,
   sidebarOpen: true,
-  sidebarTab: "chat", // "chat" | "upload" | "files"
+  sidebarTab: "chat",
 };
 
 function reducer(state, action) {
   switch (action.type) {
+    // ── Load a session from backend ──────────────────────
+    // Normalizes sources (dict → flat array) and preserves
+    // the "feedback" field ("like"/"dislike"/undefined) so
+    // thumbs up/down colors persist after sign-out and reload.
     case "SET_SESSION":
       return {
         ...state,
         sessionId: action.payload.id,
         messages: (action.payload.messages || []).map((msg) => {
-          // Normalize sources: backend stores as {"docs": [...]} or {"logs":[], "kb":[]}
-          // Frontend expects a flat array
           let sources = msg.sources;
           if (sources && !Array.isArray(sources)) {
-            // It's a dict like {"docs": [...]} or {"logs":[], "kb":[]}
             sources = [
               ...(sources.docs || []),
               ...(sources.logs || []),
               ...(sources.kb || []),
             ].filter(Boolean);
           }
-          return { ...msg, sources: sources || [] };
+          return {
+            ...msg,
+            sources: sources || [],
+            // Preserve feedback state from backend ("like", "dislike", or undefined)
+            feedback: msg.feedback || null,
+          };
         }),
       };
 
@@ -69,8 +70,22 @@ function reducer(state, action) {
             confidence: action.payload.confidence,
             processingTime: action.payload.processing_time_ms,
             timestamp: new Date().toISOString(),
+            feedback: null, // no feedback yet on new messages
           },
         ],
+      };
+
+    // ── Persist like/dislike on a specific message ───────
+    // Called after user clicks thumbs up or down.
+    // payload: { index: number, feedback: "like" | "dislike" | null }
+    case "SET_MESSAGE_FEEDBACK":
+      return {
+        ...state,
+        messages: state.messages.map((msg, i) =>
+          i === action.payload.index
+            ? { ...msg, feedback: action.payload.feedback }
+            : msg
+        ),
       };
 
     case "SET_SESSIONS":
@@ -85,7 +100,7 @@ function reducer(state, action) {
         uploadedFiles: [action.payload, ...state.uploadedFiles],
       };
 
-    case "UPDATE_FILE_STATUS": {
+    case "UPDATE_FILE_STATUS":
       return {
         ...state,
         uploadedFiles: state.uploadedFiles.map((f) =>
@@ -94,7 +109,6 @@ function reducer(state, action) {
             : f
         ),
       };
-    }
 
     case "SET_LOADING":
       return { ...state, isLoading: action.payload };
@@ -118,9 +132,7 @@ function reducer(state, action) {
 
 export function ChatProvider({ children }) {
   const [state, dispatch] = useReducer(reducer, initialState);
-
   const value = React.useMemo(() => ({ state, dispatch }), [state]);
-
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
 }
 

@@ -183,3 +183,94 @@ async def clerk_auth_dependency(request: Request) -> Optional[str]:
     request.state.clerk_payload = payload
 
     return user_id
+
+
+# ============================================================================
+# CLERK USER DETAIL FETCHING
+# ============================================================================
+# Cache of user_id → { "email": "...", "name": "...", "fetched_at": timestamp }
+# Avoids hitting Clerk API on every request. Entries expire after 1 hour.
+_user_detail_cache: dict = {}
+_CACHE_TTL = 3600  # 1 hour
+
+
+def get_clerk_user_display(user_id: Optional[str]) -> dict:
+    """
+    Fetch user email and name from Clerk Backend API.
+
+    Returns: { "email": "user@example.com", "name": "John Doe", "user_id": "user_xxx" }
+
+    Falls back to { "email": "anonymous", "name": "Anonymous", "user_id": "anonymous" }
+    if Clerk is not enabled, user_id is None, or API call fails.
+
+    Results are cached in memory for 1 hour to avoid excessive API calls.
+    """
+    import time as _time
+
+    # No user_id or Clerk not enabled → anonymous
+    if not user_id or not is_clerk_enabled() or not settings.CLERK_SECRET_KEY:
+        return {"email": "anonymous", "name": "Anonymous", "user_id": user_id or "anonymous"}
+
+    # Check cache first
+    cached = _user_detail_cache.get(user_id)
+    if cached and (_time.time() - cached.get("fetched_at", 0)) < _CACHE_TTL:
+        return cached
+
+    # Fetch from Clerk Backend API
+    # Endpoint: GET https://api.clerk.com/v1/users/{user_id}
+    # Auth: Bearer <CLERK_SECRET_KEY>
+    try:
+        import urllib.request
+        import json
+
+        url = f"https://api.clerk.com/v1/users/{user_id}"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {settings.CLERK_SECRET_KEY}",
+            "Content-Type": "application/json",
+        })
+
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        # Extract email — Clerk returns email_addresses array
+        email = "unknown"
+        email_addresses = data.get("email_addresses", [])
+        primary_email_id = data.get("primary_email_address_id")
+
+        # Find the primary email
+        for ea in email_addresses:
+            if ea.get("id") == primary_email_id:
+                email = ea.get("email_address", "unknown")
+                break
+        # Fallback: use first email if primary not found
+        if email == "unknown" and email_addresses:
+            email = email_addresses[0].get("email_address", "unknown")
+
+        # Extract name
+        first = data.get("first_name") or ""
+        last = data.get("last_name") or ""
+        name = f"{first} {last}".strip() or email.split("@")[0]
+
+        result = {
+            "email": email,
+            "name": name,
+            "user_id": user_id,
+            "fetched_at": _time.time(),
+        }
+
+        # Cache it
+        _user_detail_cache[user_id] = result
+        logger.info("Clerk user fetched: %s (%s)", name, email)
+        return result
+
+    except Exception as e:
+        logger.warning("Failed to fetch Clerk user %s: %s", user_id, e)
+        # Return user_id as fallback
+        fallback = {
+            "email": user_id,
+            "name": user_id,
+            "user_id": user_id,
+            "fetched_at": _time.time(),
+        }
+        _user_detail_cache[user_id] = fallback
+        return fallback

@@ -75,7 +75,7 @@ export default function ChatInput({ onSend }) {
       !disabled && input.trim()
         ? {
             backgroundColor: "#0A3F63",
-            borderColor: "#0A3F63",
+            borderColor: "#0A3F63", 
             color: "#fff",
           }
         : {}
